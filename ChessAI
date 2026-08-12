@@ -1,0 +1,2853 @@
+using UnityEngine;
+using System.Collections.Generic;
+using System;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using Random = UnityEngine.Random;
+
+public class ChessAI : MonoBehaviour
+{
+    public bool aiEnabled = true;
+    public bool aiPlaysWhite = false;
+    public bool highPerformanceMode = true;
+    [Range(1, 20)] public int searchDepth = 4;
+    [Range(0.1f, 120f)] public float thinkTimeSeconds = 0.5f;
+    public bool forceFullDepthSearch = false;
+
+    private ChessBoardManager boardManager;
+    private float aiTimer;
+    private const int BoardSize = 8;
+    private const float MoveInterval = 1f;
+    private const int MateScore = 100000;
+    private const int MaxQuiescenceDepth = 6;
+    private const int MaxSearchPly = 64;
+    private const int AspirationWindow = 40;
+    private const int NullMoveReduction = 2;
+    private const int MaxTranspositionEntries = 60000;
+    private const int TranspositionKeepGenerations = 24;
+    private const int MaxQuiescenceMoves = 18;
+    private const float PieceSafetyGlobalWeight = 0.75f;
+    private const float PieceSafetyEndgameFade = 0.45f;
+    private const float UndefendedPenaltyBoost = 1.45f;
+    private const int TacticalExtensionMaxPly = 20;
+
+    private float searchDeadline;
+    private bool searchAborted;
+    private int blackBookPly;
+    private int searchGeneration;
+    private OpeningBookData openingBook;
+
+    private readonly Dictionary<ulong, TTEntry> transpositionTable = new Dictionary<ulong, TTEntry>(4096);
+    private readonly int[,,,,] historyHeuristic = new int[2, BoardSize, BoardSize, BoardSize, BoardSize];
+    private readonly KillerMove[,] killerMoves = new KillerMove[MaxSearchPly, 2];
+    private readonly Stack<List<AIMove>> aiMoveListPool = new Stack<List<AIMove>>();
+    private readonly Stack<List<BookMove>> bookMoveListPool = new Stack<List<BookMove>>();
+    private readonly Stack<List<SnapshotMove>> snapshotMoveListPool = new Stack<List<SnapshotMove>>();
+    private readonly List<Vector2Int> pawnBuffer = new List<Vector2Int>(8);
+    private readonly List<ulong> transpositionPruneBuffer = new List<ulong>(256);
+    private Task<SnapshotSearchResult> activeSearchTask;
+    private static readonly ulong[,,] snapshotZobrist = CreateSnapshotZobristTable();
+    private static readonly ulong snapshotSideToMoveKey = 0x9E3779B97F4A7C15UL;
+
+    private enum TTFlag
+    {
+        Exact,
+        LowerBound,
+        UpperBound
+    }
+
+    private struct TTEntry
+    {
+        public int depth;
+        public int score;
+        public TTFlag flag;
+        public int age;
+        public bool hasBestMove;
+        public int bestStartX;
+        public int bestStartY;
+        public int bestTargetX;
+        public int bestTargetY;
+    }
+
+    private struct KillerMove
+    {
+        public int startX;
+        public int startY;
+        public int targetX;
+        public int targetY;
+        public bool valid;
+    }
+
+    private struct AIMove
+    {
+        public GameObject piece;
+        public int startX;
+        public int startY;
+        public int targetX;
+        public int targetY;
+        public int score;
+    }
+
+    private struct BookMove
+    {
+        public int startX;
+        public int startY;
+        public int targetX;
+        public int targetY;
+
+        public BookMove(int sx, int sy, int tx, int ty)
+        {
+            startX = sx;
+            startY = sy;
+            targetX = tx;
+            targetY = ty;
+        }
+    }
+
+    private struct SnapshotPiece
+    {
+        public ChessPieceType type;
+        public bool isWhite;
+        public bool hasMoved;
+    }
+
+    private struct SnapshotMove
+    {
+        public int startX;
+        public int startY;
+        public int targetX;
+        public int targetY;
+        public int score;
+    }
+
+    private struct SnapshotUndo
+    {
+        public SnapshotPiece movingPiece;
+        public SnapshotPiece capturedPiece;
+    }
+
+    private struct SnapshotSearchResult
+    {
+        public bool hasMove;
+        public int startX;
+        public int startY;
+        public int targetX;
+        public int targetY;
+        public int score;
+    }
+
+    private struct SnapshotTTEntry
+    {
+        public int depth;
+        public int score;
+        public bool hasBestMove;
+        public int bestStartX;
+        public int bestStartY;
+        public int bestTargetX;
+        public int bestTargetY;
+    }
+
+    private class BoardSnapshot
+    {
+        public SnapshotPiece[,] pieces = new SnapshotPiece[BoardSize, BoardSize];
+    }
+
+    private class SnapshotSearchContext
+    {
+        public BoardSnapshot board;
+        public Dictionary<ulong, SnapshotTTEntry> transpositionTable = new Dictionary<ulong, SnapshotTTEntry>(4096);
+        public Stopwatch stopwatch;
+        public double deadlineSeconds;
+        public bool highPerformanceMode;
+    }
+
+    [Serializable]
+    private class OpeningBookData
+    {
+        public List<OpeningBookRule> rules = new List<OpeningBookRule>();
+    }
+
+    [Serializable]
+    private class OpeningBookRule
+    {
+        public int ply;
+        public string condition;
+        public List<BookMoveJson> moves = new List<BookMoveJson>();
+    }
+
+    [Serializable]
+    private class BookMoveJson
+    {
+        public int sx;
+        public int sy;
+        public int tx;
+        public int ty;
+    }
+
+    void Start()
+    {
+        boardManager = GetComponent<ChessBoardManager>();
+        if (boardManager == null)
+            UnityEngine.Debug.LogError("ChessBoardManager가 없습니다!");
+    }
+
+    void Update()
+    {
+        if (boardManager == null || boardManager.isGameOver || !aiEnabled)
+            return;
+
+        if (boardManager.isWhiteTurn != aiPlaysWhite)
+        {
+            aiTimer = 0f;
+            return;
+        }
+
+        if (activeSearchTask != null)
+        {
+            if (activeSearchTask.IsCompleted)
+                FinishBackgroundSearch();
+
+            return;
+        }
+
+        StartBackgroundSearch();
+    }
+
+    private void StartBackgroundSearch()
+    {
+        if (boardManager == null || boardManager.isGameOver || !aiEnabled || activeSearchTask != null)
+            return;
+
+        if (TryPlayOpeningBookMove())
+            return;
+
+        BoardSnapshot snapshot = CreateBoardSnapshot();
+        bool aiPlaysBlack = !aiPlaysWhite;
+        int depthLimit = Mathf.Clamp(searchDepth, 1, 20);
+        float deadlineSeconds = forceFullDepthSearch ? float.PositiveInfinity : Mathf.Max(0.05f, thinkTimeSeconds);
+
+        activeSearchTask = Task.Run(() => SearchBestMoveSnapshot(snapshot, aiPlaysBlack, depthLimit, deadlineSeconds));
+    }
+
+    private void FinishBackgroundSearch()
+    {
+        if (activeSearchTask == null || !activeSearchTask.IsCompleted)
+            return;
+
+        try
+        {
+            SnapshotSearchResult result = activeSearchTask.Result;
+            if (result.hasMove && boardManager != null && !boardManager.isGameOver && boardManager.isWhiteTurn == aiPlaysWhite)
+            {
+                GameObject piece = boardManager.boardPieces[result.startX, result.startY];
+                if (piece != null)
+                    boardManager.ExecuteMove(piece, result.startX, result.startY, result.targetX, result.targetY);
+            }
+        }
+        catch (Exception ex)
+        {
+            UnityEngine.Debug.LogWarning($"AI 백그라운드 탐색 실패: {ex.Message}");
+        }
+        finally
+        {
+            activeSearchTask = null;
+        }
+    }
+
+    public void SetAIEnabled(bool enabled)
+    {
+        aiEnabled = enabled;
+        UnityEngine.Debug.Log($"AI {(enabled ? "활성화" : "비활성화")}됨.");
+    }
+
+    public void SetAIPlaysWhite(bool playsWhite)
+    {
+        aiPlaysWhite = playsWhite;
+        aiTimer = 0f;
+        blackBookPly = 0;
+        UnityEngine.Debug.Log($"AI 진영이 {(playsWhite ? "백(White)" : "흑(Black)")}으로 설정되었습니다.");
+    }
+
+    public void SetSearchDepth(int depth)
+    {
+        searchDepth = Mathf.Clamp(depth, 1, 20);
+        UnityEngine.Debug.Log($"AI 탐색 깊이가 {searchDepth}로 설정되었습니다.");
+    }
+
+    private List<AIMove> RentAIMoveList()
+    {
+        List<AIMove> list = aiMoveListPool.Count > 0 ? aiMoveListPool.Pop() : new List<AIMove>(64);
+        list.Clear();
+        return list;
+    }
+
+    private void ReturnAIMoveList(List<AIMove> list)
+    {
+        if (list == null)
+            return;
+
+        list.Clear();
+        aiMoveListPool.Push(list);
+    }
+
+    private List<BookMove> RentBookMoveList()
+    {
+        List<BookMove> list = bookMoveListPool.Count > 0 ? bookMoveListPool.Pop() : new List<BookMove>(16);
+        list.Clear();
+        return list;
+    }
+
+    private void ReturnBookMoveList(List<BookMove> list)
+    {
+        if (list == null)
+            return;
+
+        list.Clear();
+        bookMoveListPool.Push(list);
+    }
+
+    private List<SnapshotMove> RentSnapshotMoveList()
+    {
+        List<SnapshotMove> list = snapshotMoveListPool.Count > 0 ? snapshotMoveListPool.Pop() : new List<SnapshotMove>(64);
+        list.Clear();
+        return list;
+    }
+
+    private void ReturnSnapshotMoveList(List<SnapshotMove> list)
+    {
+        if (list == null)
+            return;
+
+        list.Clear();
+        snapshotMoveListPool.Push(list);
+    }
+
+    private static ChessPiece GetChessPiece(GameObject piece)
+    {
+        return piece != null ? piece.GetComponent<ChessPiece>() : null;
+    }
+
+    private static bool IsWhite(GameObject piece)
+    {
+        ChessPiece chessPiece = GetChessPiece(piece);
+        return chessPiece != null && chessPiece.isWhite;
+    }
+
+    private static bool IsBlack(GameObject piece)
+    {
+        ChessPiece chessPiece = GetChessPiece(piece);
+        return chessPiece != null && !chessPiece.isWhite;
+    }
+
+    private static bool IsPieceType(GameObject piece, ChessPieceType pieceType)
+    {
+        ChessPiece chessPiece = GetChessPiece(piece);
+        return chessPiece != null && chessPiece.PieceType == pieceType;
+    }
+
+    private static int NormalizeScoreForSide(int rawScore, bool sideIsBlack)
+    {
+        return sideIsBlack ? rawScore : -rawScore;
+    }
+
+    private int GetPieceValue(GameObject piece)
+    {
+        ChessPiece chessPiece = GetChessPiece(piece);
+        if (chessPiece == null)
+            return 0;
+
+        switch (chessPiece.PieceType)
+        {
+            case ChessPieceType.Pawn: return 10;
+            case ChessPieceType.Knight: return 30;
+            case ChessPieceType.Bishop: return 30;
+            case ChessPieceType.Rook: return 50;
+            case ChessPieceType.Queen: return 90;
+            case ChessPieceType.King: return 900;
+        }
+
+        return 0;
+    }
+
+    private int GetCenterControlScore(int x, int y)
+    {
+        int distance = Mathf.Abs(x - 3) + Mathf.Abs(y - 3);
+        return Mathf.Max(0, 4 - distance) * 2;
+    }
+
+    private int GetPositionalScore(GameObject piece, int x, int y)
+    {
+        ChessPiece chessPiece = GetChessPiece(piece);
+        if (chessPiece == null)
+            return 0;
+
+        int bonus = GetCenterControlScore(x, y);
+
+        switch (chessPiece.PieceType)
+        {
+            case ChessPieceType.Pawn: return bonus + 5;
+            case ChessPieceType.Knight: return bonus + 10;
+            case ChessPieceType.Bishop: return bonus + 8;
+            case ChessPieceType.Rook: return bonus + 6;
+            case ChessPieceType.Queen: return bonus + 4;
+            case ChessPieceType.King: return -Mathf.Abs(x - 3) - Mathf.Abs(y - 3);
+        }
+
+        return 0;
+    }
+
+    private int EvaluateBoard()
+    {
+        int total = 0;
+        int nonKingMaterial = 0;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (piece == null)
+                    continue;
+
+                int value = GetPieceValue(piece) + GetPositionalScore(piece, x, y);
+                total += IsBlack(piece) ? value : -value;
+
+                if (!IsPieceType(piece, ChessPieceType.King))
+                    nonKingMaterial += GetPieceValue(piece);
+            }
+        }
+
+        total += EvaluatePawnStructure(isBlack: true);
+        total -= EvaluatePawnStructure(isBlack: false);
+
+        float endgameT = Mathf.Clamp01(1f - (nonKingMaterial / 780f));
+
+        total += EvaluateKingSafety(isBlack: true);
+        total -= EvaluateKingSafety(isBlack: false);
+        total += EvaluatePieceSafety(isBlack: true, endgameT);
+        total -= EvaluatePieceSafety(isBlack: false, endgameT);
+
+        if (!highPerformanceMode)
+        {
+            total += EvaluateMobility(isBlack: true);
+            total -= EvaluateMobility(isBlack: false);
+
+            total += EvaluateRookFiles(isBlack: true);
+            total -= EvaluateRookFiles(isBlack: false);
+        }
+
+        total += EvaluateBishopPair(isBlack: true);
+        total -= EvaluateBishopPair(isBlack: false);
+
+        total += EvaluateKingActivityInEndgame(isBlack: true, endgameT);
+        total -= EvaluateKingActivityInEndgame(isBlack: false, endgameT);
+
+        if (boardManager.IsKingInCheck(true))
+            total += 20;
+
+        if (boardManager.IsKingInCheck(false))
+            total -= 20;
+
+        return total;
+    }
+
+    private int EvaluateMobility(bool isBlack)
+    {
+        int legalMoveCount = 0;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (piece == null)
+                    continue;
+
+                bool sameColor = isBlack ? IsBlack(piece) : IsWhite(piece);
+                if (!sameColor)
+                    continue;
+
+                if (IsPieceType(piece, ChessPieceType.Pawn) || IsPieceType(piece, ChessPieceType.King))
+                    continue;
+
+                for (int tx = 0; tx < BoardSize; tx++)
+                {
+                    for (int ty = 0; ty < BoardSize; ty++)
+                    {
+                        if (boardManager.IsRuleValidMove(piece, x, y, tx, ty))
+                            legalMoveCount++;
+                    }
+                }
+            }
+        }
+
+        return legalMoveCount;
+    }
+
+    private int EvaluateBishopPair(bool isBlack)
+    {
+        int bishops = 0;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (!IsPieceType(piece, ChessPieceType.Bishop))
+                    continue;
+
+                bool sameColor = isBlack ? IsBlack(piece) : IsWhite(piece);
+                if (sameColor)
+                    bishops++;
+            }
+        }
+
+        return bishops >= 2 ? 12 : 0;
+    }
+
+    private int EvaluateRookFiles(bool isBlack)
+    {
+        int score = 0;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (!IsPieceType(piece, ChessPieceType.Rook))
+                    continue;
+
+                bool sameColor = isBlack ? IsBlack(piece) : IsWhite(piece);
+                if (!sameColor)
+                    continue;
+
+                bool ownPawnOnFile = false;
+                bool enemyPawnOnFile = false;
+
+                for (int fy = 0; fy < BoardSize; fy++)
+                {
+                    GameObject onFile = boardManager.boardPieces[x, fy];
+                    if (!IsPieceType(onFile, ChessPieceType.Pawn))
+                        continue;
+
+                    bool ownPawn = isBlack ? IsBlack(onFile) : IsWhite(onFile);
+                    if (ownPawn)
+                        ownPawnOnFile = true;
+                    else
+                        enemyPawnOnFile = true;
+                }
+
+                if (!ownPawnOnFile && !enemyPawnOnFile)
+                    score += 8;
+                else if (!ownPawnOnFile)
+                    score += 4;
+            }
+        }
+
+        return score;
+    }
+
+    private bool HasNonPawnMaterial(bool forWhite)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (piece == null)
+                    continue;
+
+                bool sameColor = forWhite ? IsWhite(piece) : IsBlack(piece);
+                if (!sameColor)
+                    continue;
+
+                if (IsPieceType(piece, ChessPieceType.Pawn) || IsPieceType(piece, ChessPieceType.King))
+                    continue;
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int GetPieceTypeIndex(GameObject piece)
+    {
+        ChessPiece chessPiece = GetChessPiece(piece);
+        if (chessPiece == null)
+            return 0;
+
+        switch (chessPiece.PieceType)
+        {
+            case ChessPieceType.Pawn: return 1;
+            case ChessPieceType.Knight: return 2;
+            case ChessPieceType.Bishop: return 3;
+            case ChessPieceType.Rook: return 4;
+            case ChessPieceType.Queen: return 5;
+            case ChessPieceType.King: return 6;
+        }
+
+        return 0;
+    }
+
+    private int GetHistoryBonus(bool isBlackMove, int startX, int startY, int targetX, int targetY)
+    {
+        int side = isBlackMove ? 1 : 0;
+        return historyHeuristic[side, startX, startY, targetX, targetY];
+    }
+
+    private int GetKillerBonus(int ply, int startX, int startY, int targetX, int targetY)
+    {
+        int normalizedPly = Mathf.Clamp(ply, 0, MaxSearchPly - 1);
+
+        KillerMove first = killerMoves[normalizedPly, 0];
+        if (first.valid && first.startX == startX && first.startY == startY && first.targetX == targetX && first.targetY == targetY)
+            return 3500;
+
+        KillerMove second = killerMoves[normalizedPly, 1];
+        if (second.valid && second.startX == startX && second.startY == startY && second.targetX == targetX && second.targetY == targetY)
+            return 2500;
+
+        return 0;
+    }
+
+    private void RegisterKiller(int ply, AIMove move)
+    {
+        int normalizedPly = Mathf.Clamp(ply, 0, MaxSearchPly - 1);
+
+        KillerMove current = killerMoves[normalizedPly, 0];
+        if (current.valid && current.startX == move.startX && current.startY == move.startY && current.targetX == move.targetX && current.targetY == move.targetY)
+            return;
+
+        killerMoves[normalizedPly, 1] = killerMoves[normalizedPly, 0];
+        killerMoves[normalizedPly, 0] = new KillerMove
+        {
+            startX = move.startX,
+            startY = move.startY,
+            targetX = move.targetX,
+            targetY = move.targetY,
+            valid = true
+        };
+    }
+
+    private void RegisterHistory(bool isBlackMove, AIMove move, int depth)
+    {
+        int side = isBlackMove ? 1 : 0;
+        int bonus = depth * depth;
+        int prev = historyHeuristic[side, move.startX, move.startY, move.targetX, move.targetY];
+        historyHeuristic[side, move.startX, move.startY, move.targetX, move.targetY] = Mathf.Min(50000, prev + bonus);
+    }
+
+    private int GetMoveOrderingScore(GameObject piece, int startX, int startY, int targetX, int targetY, GameObject targetPiece, bool isBlackMove, int ply,
+        bool ttMoveValid, int ttStartX, int ttStartY, int ttTargetX, int ttTargetY, bool? precomputedGivesCheck = null)
+    {
+        int score = 0;
+
+        if (ttMoveValid && startX == ttStartX && startY == ttStartY && targetX == ttTargetX && targetY == ttTargetY)
+            score += 25000;
+
+        if (targetPiece != null)
+            score += 10000 + (GetPieceValue(targetPiece) * 12) - GetPieceValue(piece);
+
+        if (targetPiece == null)
+        {
+            score += GetKillerBonus(ply, startX, startY, targetX, targetY);
+            score += GetHistoryBonus(isBlackMove, startX, startY, targetX, targetY);
+        }
+
+        bool shouldProbeCheck = targetPiece != null || ply == 0 || (!highPerformanceMode && ply <= 2);
+        bool givesCheck = precomputedGivesCheck ?? (shouldProbeCheck && DoesMoveGiveCheck(piece, startX, startY, targetX, targetY, isBlackMove));
+
+        if (givesCheck)
+            score += 1500;
+
+        score += GetCenterControlScore(targetX, targetY);
+        return score;
+    }
+
+    private int EvaluatePawnStructure(bool isBlack)
+    {
+        int[] pawnFiles = new int[BoardSize];
+        pawnBuffer.Clear();
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (piece == null)
+                    continue;
+
+                bool sameColor = isBlack ? IsBlack(piece) : IsWhite(piece);
+                if (!sameColor || !IsPieceType(piece, ChessPieceType.Pawn))
+                    continue;
+
+                pawnFiles[x]++;
+                pawnBuffer.Add(new Vector2Int(x, y));
+            }
+        }
+
+        int score = 0;
+
+        for (int file = 0; file < BoardSize; file++)
+        {
+            if (pawnFiles[file] > 1)
+                score -= (pawnFiles[file] - 1) * 4;
+        }
+
+        for (int i = 0; i < pawnBuffer.Count; i++)
+        {
+            int x = pawnBuffer[i].x;
+            int y = pawnBuffer[i].y;
+
+            bool hasLeftSupport = x > 0 && pawnFiles[x - 1] > 0;
+            bool hasRightSupport = x < BoardSize - 1 && pawnFiles[x + 1] > 0;
+            if (!hasLeftSupport && !hasRightSupport)
+                score -= 3;
+
+            if (IsPassedPawn(isBlack, x, y))
+            {
+                int progress = isBlack ? (BoardSize - 1 - y) : y;
+                score += 4 + progress * 2;
+            }
+        }
+
+        return score;
+    }
+
+    private bool IsPassedPawn(bool isBlack, int pawnX, int pawnY)
+    {
+        for (int ex = pawnX - 1; ex <= pawnX + 1; ex++)
+        {
+            if (ex < 0 || ex >= BoardSize)
+                continue;
+
+            if (isBlack)
+            {
+                for (int ey = pawnY - 1; ey >= 0; ey--)
+                {
+                    GameObject enemy = boardManager.boardPieces[ex, ey];
+                    if (IsPieceType(enemy, ChessPieceType.Pawn) && IsWhite(enemy))
+                        return false;
+                }
+            }
+            else
+            {
+                for (int ey = pawnY + 1; ey < BoardSize; ey++)
+                {
+                    GameObject enemy = boardManager.boardPieces[ex, ey];
+                    if (IsPieceType(enemy, ChessPieceType.Pawn) && IsBlack(enemy))
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private bool TryFindKing(bool isBlack, out int kingX, out int kingY)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (!IsPieceType(piece, ChessPieceType.King))
+                    continue;
+
+                bool sameColor = isBlack ? IsBlack(piece) : IsWhite(piece);
+                if (!sameColor)
+                    continue;
+
+                kingX = x;
+                kingY = y;
+                return true;
+            }
+        }
+
+        kingX = -1;
+        kingY = -1;
+        return false;
+    }
+
+    private bool IsSquareAttackedByRule(int targetX, int targetY, bool byWhite)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject attacker = boardManager.boardPieces[x, y];
+                if (attacker == null)
+                    continue;
+
+                bool sameSide = byWhite ? IsWhite(attacker) : IsBlack(attacker);
+                if (!sameSide)
+                    continue;
+
+                if (boardManager.IsRuleValidMove(attacker, x, y, targetX, targetY))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private int EvaluateKingSafety(bool isBlack)
+    {
+        if (!TryFindKing(isBlack, out int kingX, out int kingY))
+            return 0;
+
+        int score = 0;
+        int attackers = 0;
+
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                int nx = kingX + dx;
+                int ny = kingY + dy;
+                if (nx < 0 || nx >= BoardSize || ny < 0 || ny >= BoardSize)
+                    continue;
+
+                if (IsSquareAttackedByRule(nx, ny, byWhite: isBlack ? true : false))
+                    attackers++;
+            }
+        }
+
+        score -= attackers * 3;
+
+        int pawnShieldY = isBlack ? kingY - 1 : kingY + 1;
+        if (pawnShieldY >= 0 && pawnShieldY < BoardSize)
+        {
+            for (int sx = kingX - 1; sx <= kingX + 1; sx++)
+            {
+                if (sx < 0 || sx >= BoardSize)
+                    continue;
+
+                GameObject shield = boardManager.boardPieces[sx, pawnShieldY];
+                if (!IsPieceType(shield, ChessPieceType.Pawn))
+                    continue;
+
+                bool sameColor = isBlack ? IsBlack(shield) : IsWhite(shield);
+                if (sameColor)
+                    score += 2;
+            }
+        }
+
+        return score;
+    }
+
+    private int EvaluateKingActivityInEndgame(bool isBlack, float endgameT)
+    {
+        if (endgameT <= 0.01f)
+            return 0;
+
+        if (!TryFindKing(isBlack, out int kingX, out int kingY))
+            return 0;
+
+        int center = GetCenterControlScore(kingX, kingY);
+        return Mathf.RoundToInt(center * endgameT * 2.5f);
+    }
+
+    private bool AttacksSquareByType(GameObject piece, int startX, int startY, int targetX, int targetY)
+    {
+        ChessPiece chessPiece = GetChessPiece(piece);
+        if (chessPiece == null)
+            return false;
+
+        int deltaX = targetX - startX;
+        int deltaY = targetY - startY;
+        if (deltaX == 0 && deltaY == 0)
+            return false;
+
+        switch (chessPiece.PieceType)
+        {
+            case ChessPieceType.Pawn:
+                return deltaY == (chessPiece.isWhite ? 1 : -1) && Mathf.Abs(deltaX) == 1;
+            case ChessPieceType.Knight:
+                return (Mathf.Abs(deltaX) == 1 && Mathf.Abs(deltaY) == 2) || (Mathf.Abs(deltaX) == 2 && Mathf.Abs(deltaY) == 1);
+            case ChessPieceType.Bishop:
+                if (Mathf.Abs(deltaX) != Mathf.Abs(deltaY))
+                    return false;
+                return IsPathClearOnBoard(startX, startY, targetX, targetY);
+            case ChessPieceType.Rook:
+                if (deltaX != 0 && deltaY != 0)
+                    return false;
+                return IsPathClearOnBoard(startX, startY, targetX, targetY);
+            case ChessPieceType.Queen:
+                if (deltaX == 0 || deltaY == 0 || Mathf.Abs(deltaX) == Mathf.Abs(deltaY))
+                    return IsPathClearOnBoard(startX, startY, targetX, targetY);
+                return false;
+            case ChessPieceType.King:
+                return Mathf.Abs(deltaX) <= 1 && Mathf.Abs(deltaY) <= 1;
+            default:
+                return false;
+        }
+    }
+
+    private bool IsPathClearOnBoard(int startX, int startY, int targetX, int targetY)
+    {
+        int stepX = Math.Sign(targetX - startX);
+        int stepY = Math.Sign(targetY - startY);
+        int x = startX + stepX;
+        int y = startY + stepY;
+
+        while (x != targetX || y != targetY)
+        {
+            if (boardManager.boardPieces[x, y] != null)
+                return false;
+
+            x += stepX;
+            y += stepY;
+        }
+
+        return true;
+    }
+
+    private int CountAttackersOnBoard(int targetX, int targetY, bool byBlack, out int lowestAttackerValue)
+    {
+        int count = 0;
+        lowestAttackerValue = int.MaxValue;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject attacker = boardManager.boardPieces[x, y];
+                if (attacker == null)
+                    continue;
+
+                bool sameSide = byBlack ? IsBlack(attacker) : IsWhite(attacker);
+                if (!sameSide)
+                    continue;
+
+                if (!AttacksSquareByType(attacker, x, y, targetX, targetY))
+                    continue;
+
+                count++;
+                int value = GetPieceValue(attacker);
+                if (value < lowestAttackerValue)
+                    lowestAttackerValue = value;
+            }
+        }
+
+        if (count == 0)
+            lowestAttackerValue = 0;
+
+        return count;
+    }
+
+    private int CountDefendersOnBoard(int targetX, int targetY, bool byBlack, int excludeX, int excludeY)
+    {
+        int count = 0;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                if (x == excludeX && y == excludeY)
+                    continue;
+
+                GameObject defender = boardManager.boardPieces[x, y];
+                if (defender == null)
+                    continue;
+
+                bool sameSide = byBlack ? IsBlack(defender) : IsWhite(defender);
+                if (!sameSide)
+                    continue;
+
+                if (AttacksSquareByType(defender, x, y, targetX, targetY))
+                    count++;
+            }
+        }
+
+        return count;
+    }
+
+    private int EvaluatePieceSafety(bool isBlack, float endgameT)
+    {
+        int score = 0;
+        float endgameFactor = Mathf.Lerp(1f, 1f - PieceSafetyEndgameFade, Mathf.Clamp01(endgameT));
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (piece == null || IsPieceType(piece, ChessPieceType.King))
+                    continue;
+
+                bool sameSide = isBlack ? IsBlack(piece) : IsWhite(piece);
+                if (!sameSide)
+                    continue;
+
+                int pieceValue = GetPieceValue(piece);
+                int attackers = CountAttackersOnBoard(x, y, byBlack: !isBlack, out int lowestAttackerValue);
+                if (attackers == 0)
+                    continue;
+
+                int defenders = CountDefendersOnBoard(x, y, byBlack: isBlack, excludeX: x, excludeY: y);
+                int imbalance = Mathf.Max(0, attackers - defenders);
+
+                int penalty = imbalance * Mathf.Max(2, pieceValue / 6);
+                if (defenders == 0)
+                    penalty += Mathf.RoundToInt(Mathf.Max(2, pieceValue / 4) * UndefendedPenaltyBoost);
+
+                if (lowestAttackerValue > 0 && lowestAttackerValue < pieceValue)
+                    penalty += Mathf.Max(1, (pieceValue - lowestAttackerValue) / 5);
+
+                penalty = Mathf.RoundToInt(penalty * PieceSafetyGlobalWeight * endgameFactor);
+
+                score -= penalty;
+            }
+        }
+
+        return score;
+    }
+
+    private int EvaluateMovedPieceExposureSignal(GameObject movedPiece, int targetX, int targetY, bool movedIsBlack, int capturedValue)
+    {
+        if (movedPiece == null)
+            return capturedValue;
+
+        int pieceValue = GetPieceValue(movedPiece);
+        if (pieceValue <= 0)
+            return capturedValue;
+
+        int attackers = CountAttackersOnBoard(targetX, targetY, byBlack: !movedIsBlack, out int lowestAttackerValue);
+        if (attackers == 0)
+            return capturedValue;
+
+        int defenders = CountDefendersOnBoard(targetX, targetY, byBlack: movedIsBlack, excludeX: targetX, excludeY: targetY);
+        int imbalance = Mathf.Max(0, attackers - defenders);
+
+        int penalty = imbalance * Mathf.Max(2, pieceValue / 6);
+        if (defenders == 0)
+            penalty += Mathf.RoundToInt(Mathf.Max(2, pieceValue / 4) * UndefendedPenaltyBoost);
+
+        if (lowestAttackerValue > 0 && lowestAttackerValue < pieceValue)
+            penalty += Mathf.Max(1, (pieceValue - lowestAttackerValue) / 5);
+
+        return capturedValue - penalty;
+    }
+
+    private bool ShouldExtendForExposureTrade(int depth, int ply, int tacticalSignal, int movedPieceValue, bool isCapture)
+    {
+        if (depth <= 1 || ply >= TacticalExtensionMaxPly)
+            return false;
+
+        int riskThreshold = Mathf.Max(6, movedPieceValue / 5);
+        int gainThreshold = Mathf.Max(8, movedPieceValue / 6);
+
+        bool severeRisk = tacticalSignal <= -riskThreshold;
+        bool meaningfulCompensation = tacticalSignal >= gainThreshold;
+        bool speculativeSacrifice = !isCapture && tacticalSignal <= -Mathf.Max(8, movedPieceValue / 4);
+
+        return severeRisk || meaningfulCompensation || speculativeSacrifice;
+    }
+
+    private ulong ComputeBoardHash(bool whiteToMove)
+    {
+        unchecked
+        {
+            ulong hash = 1469598103934665603UL;
+
+            for (int x = 0; x < BoardSize; x++)
+            {
+                for (int y = 0; y < BoardSize; y++)
+                {
+                    GameObject piece = boardManager.boardPieces[x, y];
+                    if (piece == null)
+                        continue;
+
+                    ulong cell = (ulong)(x * BoardSize + y + 1);
+                    hash ^= cell;
+                    hash *= 1099511628211UL;
+
+                    ChessPiece cp = GetChessPiece(piece);
+                    bool isWhitePiece = cp != null && cp.isWhite;
+                    bool hasMoved = cp != null && cp.hasMoved;
+                    int pieceType = GetPieceTypeIndex(piece);
+
+                    ulong pieceCode = (ulong)(pieceType + (isWhitePiece ? 8 : 16) + (hasMoved ? 32 : 0));
+                    hash ^= pieceCode;
+                    hash *= 1099511628211UL;
+                }
+            }
+
+            hash ^= whiteToMove ? 1UL : 2UL;
+            hash *= 1099511628211UL;
+            return hash;
+        }
+    }
+
+    private void StoreTransposition(ulong hash, TTEntry candidate)
+    {
+        if (transpositionTable.TryGetValue(hash, out TTEntry existing))
+        {
+            bool replace = false;
+            if (candidate.depth > existing.depth)
+                replace = true;
+            else if (candidate.depth == existing.depth && candidate.age >= existing.age)
+                replace = true;
+            else if (candidate.flag == TTFlag.Exact && existing.flag != TTFlag.Exact)
+                replace = true;
+
+            if (replace)
+                transpositionTable[hash] = candidate;
+
+            return;
+        }
+
+        if (transpositionTable.Count >= MaxTranspositionEntries)
+            PruneTranspositionTable();
+
+        if (transpositionTable.Count < MaxTranspositionEntries)
+            transpositionTable[hash] = candidate;
+    }
+
+    private void PruneTranspositionTable()
+    {
+        transpositionPruneBuffer.Clear();
+
+        foreach (KeyValuePair<ulong, TTEntry> kv in transpositionTable)
+        {
+            if (searchGeneration - kv.Value.age > TranspositionKeepGenerations)
+                transpositionPruneBuffer.Add(kv.Key);
+        }
+
+        for (int i = 0; i < transpositionPruneBuffer.Count; i++)
+            transpositionTable.Remove(transpositionPruneBuffer[i]);
+
+        if (transpositionTable.Count >= MaxTranspositionEntries)
+            transpositionTable.Clear();
+    }
+
+    private bool DoesMoveGiveCheck(GameObject piece, int startX, int startY, int targetX, int targetY, bool isBlackMove)
+    {
+        ApplyTemporaryMove(piece, startX, startY, targetX, targetY, out GameObject capturedPiece);
+        bool givesCheck = boardManager.IsKingInCheck(!isBlackMove);
+        RevertTemporaryMove(piece, startX, startY, targetX, targetY, capturedPiece);
+        return givesCheck;
+    }
+
+    private int QuiescenceSearch(int alpha, int beta, bool whiteToMove, int depth)
+    {
+        if (searchAborted || Time.realtimeSinceStartup >= searchDeadline)
+        {
+            searchAborted = true;
+            return EvaluateBoard();
+        }
+
+        int standPat = EvaluateBoard();
+
+        if (depth <= 0)
+            return standPat;
+
+        if (!whiteToMove)
+        {
+            if (standPat >= beta)
+                return standPat;
+
+            if (standPat > alpha)
+                alpha = standPat;
+
+            List<AIMove> captures = RentAIMoveList();
+            try
+            {
+                CollectMoves(captures, isBlack: true, ply: 0, capturesOnly: true, includeCheckingMoves: true);
+                int moveLimit = highPerformanceMode ? Mathf.Min(MaxQuiescenceMoves, captures.Count) : captures.Count;
+                for (int i = 0; i < moveLimit; i++)
+                {
+                    AIMove move = captures[i];
+                    GameObject captured;
+                    ApplyTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, out captured);
+                    int score = QuiescenceSearch(alpha, beta, true, depth - 1);
+                    RevertTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, captured);
+
+                    if (searchAborted)
+                        return alpha;
+
+                    if (score > alpha)
+                        alpha = score;
+
+                    if (alpha >= beta)
+                        break;
+                }
+
+                return alpha;
+            }
+            finally
+            {
+                ReturnAIMoveList(captures);
+            }
+        }
+
+        if (standPat <= alpha)
+            return standPat;
+
+        if (standPat < beta)
+            beta = standPat;
+
+        List<AIMove> whiteCaptures = RentAIMoveList();
+        try
+        {
+            CollectMoves(whiteCaptures, isBlack: false, ply: 0, capturesOnly: true, includeCheckingMoves: true);
+            int whiteMoveLimit = highPerformanceMode ? Mathf.Min(MaxQuiescenceMoves, whiteCaptures.Count) : whiteCaptures.Count;
+            for (int i = 0; i < whiteMoveLimit; i++)
+            {
+                AIMove move = whiteCaptures[i];
+                GameObject captured;
+                ApplyTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, out captured);
+                int score = QuiescenceSearch(alpha, beta, false, depth - 1);
+                RevertTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, captured);
+
+                if (searchAborted)
+                    return beta;
+
+                if (score < beta)
+                    beta = score;
+
+                if (beta <= alpha)
+                    break;
+            }
+
+            return beta;
+        }
+        finally
+        {
+            ReturnAIMoveList(whiteCaptures);
+        }
+    }
+
+    private int Minimax(int depth, int alpha, int beta, bool whiteToMove, int ply, bool allowNullMove)
+    {
+        if (searchAborted || Time.realtimeSinceStartup >= searchDeadline)
+        {
+            searchAborted = true;
+            return EvaluateBoard();
+        }
+
+        bool sideInCheck = boardManager.IsKingInCheck(whiteToMove);
+
+        int alphaOriginal = alpha;
+        int betaOriginal = beta;
+        ulong hash = ComputeBoardHash(whiteToMove);
+        bool ttMoveValid = false;
+        int ttStartX = -1;
+        int ttStartY = -1;
+        int ttTargetX = -1;
+        int ttTargetY = -1;
+
+        if (transpositionTable.TryGetValue(hash, out TTEntry entry) && entry.depth >= depth)
+        {
+            if (entry.flag == TTFlag.Exact)
+                return entry.score;
+
+            if (entry.hasBestMove)
+            {
+                ttMoveValid = true;
+                ttStartX = entry.bestStartX;
+                ttStartY = entry.bestStartY;
+                ttTargetX = entry.bestTargetX;
+                ttTargetY = entry.bestTargetY;
+            }
+
+            if (entry.flag == TTFlag.LowerBound)
+                alpha = Mathf.Max(alpha, entry.score);
+            else
+                beta = Mathf.Min(beta, entry.score);
+
+            if (alpha >= beta)
+                return entry.score;
+        }
+
+        if (depth <= 0)
+        {
+            if (!sideInCheck || ply >= MaxSearchPly - 2)
+                return QuiescenceSearch(alpha, beta, whiteToMove, MaxQuiescenceDepth);
+
+            depth = 1;
+        }
+
+        // Null-move pruning helps cut branches where passing still keeps a good enough position.
+        if (allowNullMove && depth >= 3 && !sideInCheck && HasNonPawnMaterial(whiteToMove))
+        {
+            if (!whiteToMove)
+            {
+                int nullScore = Minimax(depth - 1 - NullMoveReduction, alpha, beta, true, ply + 1, false);
+                if (!searchAborted && nullScore >= beta)
+                    return nullScore;
+            }
+            else
+            {
+                int nullScore = Minimax(depth - 1 - NullMoveReduction, alpha, beta, false, ply + 1, false);
+                if (!searchAborted && nullScore <= alpha)
+                    return nullScore;
+            }
+        }
+
+        List<AIMove> legalMoves = RentAIMoveList();
+        try
+        {
+            CollectMoves(legalMoves, isBlack: !whiteToMove, ply: ply, capturesOnly: false,
+                ttMoveValid: ttMoveValid, ttStartX: ttStartX, ttStartY: ttStartY, ttTargetX: ttTargetX, ttTargetY: ttTargetY);
+
+            if (legalMoves.Count == 0)
+            {
+                if (boardManager.IsKingInCheck(whiteToMove))
+                    return whiteToMove ? MateScore : -MateScore;
+
+                return 0;
+            }
+
+            int bestScore;
+            AIMove bestMove = default;
+            bool hasBestMove = false;
+
+            if (!whiteToMove)
+            {
+                bestScore = int.MinValue;
+                bool isBlackMove = true;
+                bool exploredAny = false;
+
+                for (int moveIndex = 0; moveIndex < legalMoves.Count; moveIndex++)
+                {
+                    AIMove move = legalMoves[moveIndex];
+                    GameObject captured;
+                    ApplyTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, out captured);
+
+                    int nextDepth = depth - 1;
+                    bool isQuietMove = captured == null;
+                    GameObject movedPieceAfter = boardManager.boardPieces[move.targetX, move.targetY];
+                    int movedPieceValue = GetPieceValue(movedPieceAfter);
+                    int tacticalSignal = EvaluateMovedPieceExposureSignal(movedPieceAfter, move.targetX, move.targetY, movedIsBlack: true, capturedValue: GetPieceValue(captured));
+                    bool shouldExtend = ShouldExtendForExposureTrade(depth, ply, tacticalSignal, movedPieceValue, isCapture: !isQuietMove);
+
+                    bool canReduce = depth >= 3 && moveIndex >= 3 && isQuietMove && !sideInCheck && !shouldExtend;
+                    if (canReduce)
+                        nextDepth = depth - 2;
+
+                    if (shouldExtend && (!highPerformanceMode || !isQuietMove))
+                        nextDepth = Mathf.Max(nextDepth, depth);
+
+                    int score = Minimax(nextDepth, alpha, beta, true, ply + 1, true);
+                    if (canReduce && !searchAborted && score > alpha)
+                        score = Minimax(depth - 1, alpha, beta, true, ply + 1, true);
+
+                    RevertTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, captured);
+
+                    if (searchAborted)
+                        return exploredAny ? bestScore : EvaluateBoard();
+
+                    exploredAny = true;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestMove = move;
+                        hasBestMove = true;
+                    }
+
+                    if (bestScore > alpha)
+                        alpha = bestScore;
+
+                    if (beta <= alpha)
+                    {
+                        if (captured == null)
+                        {
+                            RegisterKiller(ply, move);
+                            RegisterHistory(isBlackMove, move, depth);
+                        }
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                bestScore = int.MaxValue;
+                bool isBlackMove = false;
+                bool exploredAny = false;
+
+                for (int moveIndex = 0; moveIndex < legalMoves.Count; moveIndex++)
+                {
+                    AIMove move = legalMoves[moveIndex];
+                    GameObject captured;
+                    ApplyTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, out captured);
+
+                    int nextDepth = depth - 1;
+                    bool isQuietMove = captured == null;
+                    GameObject movedPieceAfter = boardManager.boardPieces[move.targetX, move.targetY];
+                    int movedPieceValue = GetPieceValue(movedPieceAfter);
+                    int tacticalSignal = EvaluateMovedPieceExposureSignal(movedPieceAfter, move.targetX, move.targetY, movedIsBlack: false, capturedValue: GetPieceValue(captured));
+                    bool shouldExtend = ShouldExtendForExposureTrade(depth, ply, tacticalSignal, movedPieceValue, isCapture: !isQuietMove);
+
+                    bool canReduce = depth >= 3 && moveIndex >= 3 && isQuietMove && !sideInCheck && !shouldExtend;
+                    if (canReduce)
+                        nextDepth = depth - 2;
+
+                    if (shouldExtend && (!highPerformanceMode || !isQuietMove))
+                        nextDepth = Mathf.Max(nextDepth, depth);
+
+                    int score = Minimax(nextDepth, alpha, beta, false, ply + 1, true);
+                    if (canReduce && !searchAborted && score < beta)
+                        score = Minimax(depth - 1, alpha, beta, false, ply + 1, true);
+
+                    RevertTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, captured);
+
+                    if (searchAborted)
+                        return exploredAny ? bestScore : EvaluateBoard();
+
+                    exploredAny = true;
+
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        bestMove = move;
+                        hasBestMove = true;
+                    }
+
+                    if (bestScore < beta)
+                        beta = bestScore;
+
+                    if (beta <= alpha)
+                    {
+                        if (captured == null)
+                        {
+                            RegisterKiller(ply, move);
+                            RegisterHistory(isBlackMove, move, depth);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            TTFlag flag = TTFlag.Exact;
+            if (bestScore <= alphaOriginal)
+                flag = TTFlag.UpperBound;
+            else if (bestScore >= betaOriginal)
+                flag = TTFlag.LowerBound;
+
+            StoreTransposition(hash, new TTEntry
+            {
+                depth = depth,
+                score = bestScore,
+                flag = flag,
+                age = searchGeneration,
+                hasBestMove = hasBestMove,
+                bestStartX = bestMove.startX,
+                bestStartY = bestMove.startY,
+                bestTargetX = bestMove.targetX,
+                bestTargetY = bestMove.targetY
+            });
+
+            return bestScore;
+        }
+        finally
+        {
+            ReturnAIMoveList(legalMoves);
+        }
+    }
+
+    private void ApplyTemporaryMove(GameObject piece, int startX, int startY, int targetX, int targetY, out GameObject capturedPiece)
+    {
+        capturedPiece = boardManager.boardPieces[targetX, targetY];
+        boardManager.boardPieces[targetX, targetY] = piece;
+        boardManager.boardPieces[startX, startY] = null;
+    }
+
+    private void RevertTemporaryMove(GameObject piece, int startX, int startY, int targetX, int targetY, GameObject capturedPiece)
+    {
+        boardManager.boardPieces[startX, startY] = piece;
+        boardManager.boardPieces[targetX, targetY] = capturedPiece;
+    }
+
+    private void MakeAIMove()
+    {
+        bool aiPlaysBlack = !aiPlaysWhite;
+        bool maximizingRoot = aiPlaysBlack;
+
+        if (TryPlayOpeningBookMove())
+            return;
+
+        searchGeneration++;
+        if (searchGeneration > 1000000)
+            searchGeneration = 1;
+
+        if (transpositionTable.Count >= MaxTranspositionEntries)
+            PruneTranspositionTable();
+
+        searchAborted = false;
+        searchDeadline = forceFullDepthSearch
+            ? float.PositiveInfinity
+            : Time.realtimeSinceStartup + Mathf.Max(0.05f, thinkTimeSeconds);
+
+        List<AIMove> possibleMoves = RentAIMoveList();
+        List<AIMove> bestMoves = RentAIMoveList();
+        List<AIMove> depthBestMoves = RentAIMoveList();
+
+        try
+        {
+            CollectMoves(possibleMoves, isBlack: aiPlaysBlack, ply: 0);
+            if (possibleMoves.Count == 0) return;
+
+            int depthLimit = Mathf.Clamp(searchDepth, 1, 20);
+            bestMoves.AddRange(possibleMoves);
+            int bestScore = maximizingRoot ? int.MinValue : int.MaxValue;
+            bool hasStableBest = false;
+            int previousIterationScore = 0;
+
+            for (int currentDepth = 1; currentDepth <= depthLimit; currentDepth++)
+            {
+                if (Time.realtimeSinceStartup >= searchDeadline)
+                    break;
+
+                int depthBestScore = maximizingRoot ? int.MinValue : int.MaxValue;
+                depthBestMoves.Clear();
+
+                int alpha = currentDepth == 1 ? int.MinValue + 1 : previousIterationScore - AspirationWindow;
+                int beta = currentDepth == 1 ? int.MaxValue - 1 : previousIterationScore + AspirationWindow;
+
+                for (int i = 0; i < possibleMoves.Count; i++)
+                {
+                    if (Time.realtimeSinceStartup >= searchDeadline)
+                    {
+                        searchAborted = true;
+                        break;
+                    }
+
+                    AIMove move = possibleMoves[i];
+                    GameObject captured;
+                    ApplyTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, out captured);
+                    int score = Minimax(currentDepth - 1, alpha, beta, !aiPlaysWhite, 1, true);
+
+                    if (!searchAborted && (score <= alpha || score >= beta))
+                        score = Minimax(currentDepth - 1, int.MinValue + 1, int.MaxValue - 1, !aiPlaysWhite, 1, true);
+
+                    RevertTemporaryMove(move.piece, move.startX, move.startY, move.targetX, move.targetY, captured);
+
+                    if (searchAborted)
+                        break;
+
+                    move.score = score;
+                    possibleMoves[i] = move;
+
+                    bool isBetter = maximizingRoot ? score > depthBestScore : score < depthBestScore;
+                    if (isBetter)
+                    {
+                        depthBestScore = score;
+                        depthBestMoves.Clear();
+                        depthBestMoves.Add(move);
+                    }
+                    else if (score == depthBestScore)
+                    {
+                        depthBestMoves.Add(move);
+                    }
+                }
+
+                if (!searchAborted && depthBestMoves.Count > 0)
+                {
+                    bestScore = depthBestScore;
+                    hasStableBest = true;
+                    previousIterationScore = depthBestScore;
+                    bestMoves.Clear();
+                    bestMoves.AddRange(depthBestMoves);
+
+                    possibleMoves.Sort((a, b) => b.score.CompareTo(a.score));
+                }
+
+                if (searchAborted)
+                    break;
+            }
+
+            if (bestMoves.Count == 0)
+            {
+                if (possibleMoves.Count == 0)
+                {
+                    UnityEngine.Debug.LogWarning("AI가 선택 가능한 수를 찾지 못해 턴을 종료합니다.");
+                    return;
+                }
+
+                bestMoves.Add(possibleMoves[0]);
+            }
+
+            int chosenIndex = bestMoves.Count == 1 ? 0 : Random.Range(0, bestMoves.Count);
+            AIMove chosenMove = bestMoves[chosenIndex];
+            chosenMove.score = hasStableBest ? bestScore : chosenMove.score;
+
+            int aiScore = NormalizeScoreForSide(chosenMove.score, aiPlaysBlack);
+
+            if (aiScore > 0)
+                UnityEngine.Debug.Log($"🤖 AI: 이득이 큽니다! ({aiScore}점짜리 안전한 공격을 실행합니다.)");
+            else if (aiScore < 0)
+                UnityEngine.Debug.Log($"🤖 AI: 모든 곳이 위험합니다. 어쩔 수 없이 희생합니다... (점수: {aiScore})");
+            else
+                UnityEngine.Debug.Log("🤖 AI: 조심스럽게 안전한 곳으로 이동합니다.");
+
+            boardManager.ExecuteMove(chosenMove.piece, chosenMove.startX, chosenMove.startY, chosenMove.targetX, chosenMove.targetY);
+            if (aiPlaysBlack)
+                blackBookPly++;
+        }
+        finally
+        {
+            ReturnAIMoveList(depthBestMoves);
+            ReturnAIMoveList(bestMoves);
+            ReturnAIMoveList(possibleMoves);
+        }
+    }
+
+    private bool TryPlayOpeningBookMove()
+    {
+        if (aiPlaysWhite)
+            return false;
+
+        if (blackBookPly > 1)
+            return false;
+
+        List<BookMove> candidates = RentBookMoveList();
+        try
+        {
+            GetOpeningCandidatesForCurrentBoard(candidates);
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                BookMove book = candidates[i];
+                GameObject piece = boardManager.boardPieces[book.startX, book.startY];
+                if (piece == null || !IsBlack(piece))
+                    continue;
+
+                if (!boardManager.IsValidMove(piece, book.startX, book.startY, book.targetX, book.targetY))
+                    continue;
+
+                UnityEngine.Debug.Log("🤖 AI 북 수 선택: 초반 정석 전개를 사용합니다.");
+                boardManager.ExecuteMove(piece, book.startX, book.startY, book.targetX, book.targetY);
+                blackBookPly++;
+                return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            ReturnBookMoveList(candidates);
+        }
+    }
+
+    private void LoadOpeningBook()
+    {
+        TextAsset openingBookJson = Resources.Load<TextAsset>("opening_book_black");
+        if (openingBookJson == null)
+        {
+            UnityEngine.Debug.LogWarning("opening_book_black.json을 찾지 못해 내장 기본 오프닝 북을 사용합니다.");
+            openingBook = BuildFallbackOpeningBook();
+            return;
+        }
+
+        try
+        {
+            openingBook = JsonUtility.FromJson<OpeningBookData>(openingBookJson.text);
+            if (openingBook == null || openingBook.rules == null || openingBook.rules.Count == 0)
+            {
+                UnityEngine.Debug.LogWarning("오프닝 북 JSON이 비어 있어 내장 기본 오프닝 북을 사용합니다.");
+                openingBook = BuildFallbackOpeningBook();
+            }
+        }
+        catch (Exception ex)
+        {
+            UnityEngine.Debug.LogWarning($"오프닝 북 JSON 파싱 실패: {ex.Message}. 내장 기본 오프닝 북을 사용합니다.");
+            openingBook = BuildFallbackOpeningBook();
+        }
+    }
+
+    private OpeningBookData BuildFallbackOpeningBook()
+    {
+        var data = new OpeningBookData();
+
+        data.rules.Add(new OpeningBookRule
+        {
+            ply = 0,
+            condition = "e4",
+            moves = new List<BookMoveJson>
+            {
+                new BookMoveJson { sx = 4, sy = 6, tx = 4, ty = 4 },
+                new BookMoveJson { sx = 2, sy = 6, tx = 2, ty = 4 }
+            }
+        });
+
+        data.rules.Add(new OpeningBookRule
+        {
+            ply = 0,
+            condition = "d4",
+            moves = new List<BookMoveJson>
+            {
+                new BookMoveJson { sx = 3, sy = 6, tx = 3, ty = 4 },
+                new BookMoveJson { sx = 6, sy = 7, tx = 5, ty = 5 }
+            }
+        });
+
+        data.rules.Add(new OpeningBookRule
+        {
+            ply = 0,
+            condition = "nf3_or_nc3",
+            moves = new List<BookMoveJson>
+            {
+                new BookMoveJson { sx = 3, sy = 6, tx = 3, ty = 4 },
+                new BookMoveJson { sx = 6, sy = 7, tx = 5, ty = 5 }
+            }
+        });
+
+        data.rules.Add(new OpeningBookRule
+        {
+            ply = 0,
+            condition = "any",
+            moves = new List<BookMoveJson>
+            {
+                new BookMoveJson { sx = 4, sy = 6, tx = 4, ty = 4 },
+                new BookMoveJson { sx = 3, sy = 6, tx = 3, ty = 4 },
+                new BookMoveJson { sx = 6, sy = 7, tx = 5, ty = 5 },
+                new BookMoveJson { sx = 1, sy = 7, tx = 2, ty = 5 }
+            }
+        });
+
+        data.rules.Add(new OpeningBookRule
+        {
+            ply = 1,
+            condition = "any",
+            moves = new List<BookMoveJson>
+            {
+                new BookMoveJson { sx = 6, sy = 7, tx = 5, ty = 5 },
+                new BookMoveJson { sx = 1, sy = 7, tx = 2, ty = 5 },
+                new BookMoveJson { sx = 5, sy = 7, tx = 2, ty = 4 },
+                new BookMoveJson { sx = 4, sy = 6, tx = 4, ty = 5 }
+            }
+        });
+
+        return data;
+    }
+
+    private void GetOpeningCandidatesForCurrentBoard(List<BookMove> candidates)
+    {
+        if (openingBook == null || openingBook.rules == null)
+            return;
+
+        for (int i = 0; i < openingBook.rules.Count; i++)
+        {
+            OpeningBookRule rule = openingBook.rules[i];
+            if (rule == null || rule.ply != blackBookPly || !IsBookConditionMatched(rule.condition))
+                continue;
+
+            AppendRuleMoves(candidates, rule);
+        }
+
+        if (candidates.Count == 0)
+        {
+            for (int i = 0; i < openingBook.rules.Count; i++)
+            {
+                OpeningBookRule rule = openingBook.rules[i];
+                if (rule == null || rule.ply != blackBookPly)
+                    continue;
+
+                if (!string.Equals(rule.condition, "any", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                AppendRuleMoves(candidates, rule);
+            }
+        }
+    }
+
+    private void AppendRuleMoves(List<BookMove> result, OpeningBookRule rule)
+    {
+        if (rule.moves == null)
+            return;
+
+        for (int i = 0; i < rule.moves.Count; i++)
+        {
+            BookMoveJson move = rule.moves[i];
+            result.Add(new BookMove(move.sx, move.sy, move.tx, move.ty));
+        }
+    }
+
+    private bool IsBookConditionMatched(string condition)
+    {
+        if (string.IsNullOrWhiteSpace(condition) || string.Equals(condition, "any", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        string key = condition.Trim().ToLowerInvariant();
+        if (key == "e4")
+            return HasPieceAt(4, 3, isWhite: true, pieceType: ChessPieceType.Pawn);
+        if (key == "d4")
+            return HasPieceAt(3, 3, isWhite: true, pieceType: ChessPieceType.Pawn);
+        if (key == "nf3")
+            return HasPieceAt(5, 2, isWhite: true, pieceType: ChessPieceType.Knight);
+        if (key == "nc3")
+            return HasPieceAt(2, 2, isWhite: true, pieceType: ChessPieceType.Knight);
+        if (key == "nf3_or_nc3")
+            return HasPieceAt(5, 2, isWhite: true, pieceType: ChessPieceType.Knight) || HasPieceAt(2, 2, isWhite: true, pieceType: ChessPieceType.Knight);
+
+        return false;
+    }
+
+    private bool HasPieceAt(int x, int y, bool isWhite, ChessPieceType pieceType)
+    {
+        GameObject piece = boardManager.boardPieces[x, y];
+        if (piece == null)
+            return false;
+
+        bool sameColor = isWhite ? IsWhite(piece) : IsBlack(piece);
+        return sameColor && IsPieceType(piece, pieceType);
+    }
+
+    private void CollectMoves(List<AIMove> result, bool isBlack, int ply, bool capturesOnly = false,
+        bool ttMoveValid = false, int ttStartX = -1, int ttStartY = -1, int ttTargetX = -1, int ttTargetY = -1,
+        bool includeCheckingMoves = false)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = boardManager.boardPieces[x, y];
+                if (piece == null || (isBlack ? !IsBlack(piece) : !IsWhite(piece)))
+                    continue;
+
+                for (int tx = 0; tx < BoardSize; tx++)
+                {
+                    for (int ty = 0; ty < BoardSize; ty++)
+                    {
+                        if (!boardManager.IsValidMove(piece, x, y, tx, ty))
+                            continue;
+
+                        GameObject targetPiece = boardManager.boardPieces[tx, ty];
+                        bool? givesCheck = null;
+                        if (capturesOnly && targetPiece == null)
+                        {
+                            if (!includeCheckingMoves)
+                                continue;
+
+                            bool checkingMove = DoesMoveGiveCheck(piece, x, y, tx, ty, isBlack);
+                            if (!checkingMove)
+                                continue;
+
+                            givesCheck = true;
+                        }
+
+                        int orderingScore = GetMoveOrderingScore(piece, x, y, tx, ty, targetPiece, isBlack, ply,
+                            ttMoveValid, ttStartX, ttStartY, ttTargetX, ttTargetY, givesCheck);
+
+                        result.Add(new AIMove
+                        {
+                            piece = piece,
+                            startX = x,
+                            startY = y,
+                            targetX = tx,
+                            targetY = ty,
+                            score = orderingScore
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    private static ulong[,,] CreateSnapshotZobristTable()
+    {
+        var table = new ulong[BoardSize, BoardSize, 25];
+        var rng = new System.Random(1337);
+        byte[] buffer = new byte[8];
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                for (int i = 0; i < 25; i++)
+                {
+                    rng.NextBytes(buffer);
+                    ulong value = BitConverter.ToUInt64(buffer, 0);
+                    table[x, y, i] = value == 0 ? 1UL : value;
+                }
+            }
+        }
+
+        return table;
+    }
+
+    private static int GetSnapshotPieceIndex(SnapshotPiece piece)
+    {
+        if (piece.type == ChessPieceType.None)
+            return 0;
+
+        int typeIndex = piece.type switch
+        {
+            ChessPieceType.Pawn => 1,
+            ChessPieceType.Knight => 2,
+            ChessPieceType.Bishop => 3,
+            ChessPieceType.Rook => 4,
+            ChessPieceType.Queen => 5,
+            ChessPieceType.King => 6,
+            _ => 0
+        };
+
+        if (typeIndex == 0)
+            return 0;
+
+        int colorOffset = piece.isWhite ? 0 : 6;
+        int movedOffset = piece.hasMoved ? 12 : 0;
+        return typeIndex + colorOffset + movedOffset;
+    }
+
+    private static ulong GetSnapshotZobristKey(int x, int y, int pieceIndex)
+    {
+        return snapshotZobrist[x, y, pieceIndex];
+    }
+
+    private BoardSnapshot CreateBoardSnapshot()
+    {
+        var snapshot = new BoardSnapshot();
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject pieceObject = boardManager.boardPieces[x, y];
+                ChessPiece piece = GetChessPiece(pieceObject);
+                if (piece == null)
+                {
+                    snapshot.pieces[x, y] = default;
+                    continue;
+                }
+
+                snapshot.pieces[x, y] = new SnapshotPiece
+                {
+                    type = piece.PieceType,
+                    isWhite = piece.isWhite,
+                    hasMoved = piece.hasMoved
+                };
+            }
+        }
+
+        return snapshot;
+    }
+
+    private SnapshotSearchResult SearchBestMoveSnapshot(BoardSnapshot snapshot, bool aiPlaysBlack, int depthLimit, double deadlineSeconds)
+    {
+        var context = new SnapshotSearchContext
+        {
+            board = snapshot,
+            stopwatch = Stopwatch.StartNew(),
+            deadlineSeconds = deadlineSeconds,
+            highPerformanceMode = highPerformanceMode
+        };
+
+        bool whiteToMove = !aiPlaysBlack;
+        ulong rootHash = ComputeSnapshotHash(snapshot, whiteToMove);
+        List<SnapshotMove> rootMoves = RentSnapshotMoveList();
+        List<SnapshotMove> bestMoves = RentSnapshotMoveList();
+        List<SnapshotMove> depthBestMoves = RentSnapshotMoveList();
+
+        try
+        {
+            CollectSnapshotMoves(rootMoves, snapshot, aiPlaysBlack, capturesOnly: false, ply: 0, rootHash, context);
+
+            if (rootMoves.Count == 0)
+                return default;
+
+            rootMoves.Sort((a, b) => b.score.CompareTo(a.score));
+
+            SnapshotSearchResult bestResult = default;
+            bool hasStableBest = false;
+            int previousIterationScore = 0;
+
+            for (int currentDepth = 1; currentDepth <= depthLimit; currentDepth++)
+            {
+                if (context.stopwatch.Elapsed.TotalSeconds >= context.deadlineSeconds)
+                    break;
+
+                depthBestMoves.Clear();
+                int depthBestScore = aiPlaysBlack ? int.MinValue : int.MaxValue;
+
+                int alpha = currentDepth == 1 ? int.MinValue + 1 : previousIterationScore - AspirationWindow;
+                int beta = currentDepth == 1 ? int.MaxValue - 1 : previousIterationScore + AspirationWindow;
+
+                for (int i = 0; i < rootMoves.Count; i++)
+                {
+                    if (context.stopwatch.Elapsed.TotalSeconds >= context.deadlineSeconds)
+                        break;
+
+                    SnapshotMove move = rootMoves[i];
+                    SnapshotUndo undo;
+                    ApplySnapshotMove(snapshot, move, out undo);
+                    ulong childHash = UpdateSnapshotHash(rootHash, move, undo, whiteToMove);
+
+                    int score = MinimaxSnapshot(context, currentDepth - 1, alpha, beta, !whiteToMove, 1, true, childHash);
+
+                    if ((score <= alpha || score >= beta) && context.stopwatch.Elapsed.TotalSeconds < context.deadlineSeconds)
+                        score = MinimaxSnapshot(context, currentDepth - 1, int.MinValue + 1, int.MaxValue - 1, !whiteToMove, 1, true, childHash);
+
+                    RevertSnapshotMove(snapshot, move, undo);
+
+                    move.score = score;
+                    rootMoves[i] = move;
+
+                    bool isBetter = aiPlaysBlack ? score > depthBestScore : score < depthBestScore;
+                    if (isBetter)
+                    {
+                        depthBestScore = score;
+                        depthBestMoves.Clear();
+                        depthBestMoves.Add(move);
+                    }
+                    else if (score == depthBestScore)
+                    {
+                        depthBestMoves.Add(move);
+                    }
+                }
+
+                if (depthBestMoves.Count > 0)
+                {
+                    hasStableBest = true;
+                    previousIterationScore = depthBestScore;
+                    bestResult = new SnapshotSearchResult
+                    {
+                        hasMove = true,
+                        startX = depthBestMoves[0].startX,
+                        startY = depthBestMoves[0].startY,
+                        targetX = depthBestMoves[0].targetX,
+                        targetY = depthBestMoves[0].targetY,
+                        score = NormalizeScoreForSide(depthBestScore, aiPlaysBlack)
+                    };
+
+                    bestMoves.Clear();
+                    bestMoves.AddRange(depthBestMoves);
+
+                    rootMoves.Sort((a, b) => b.score.CompareTo(a.score));
+                }
+
+                if (context.stopwatch.Elapsed.TotalSeconds >= context.deadlineSeconds)
+                    break;
+            }
+
+            if (!hasStableBest && rootMoves.Count > 0)
+            {
+                SnapshotMove fallback = rootMoves[0];
+                bestResult = new SnapshotSearchResult
+                {
+                    hasMove = true,
+                    startX = fallback.startX,
+                    startY = fallback.startY,
+                    targetX = fallback.targetX,
+                    targetY = fallback.targetY,
+                    score = NormalizeScoreForSide(fallback.score, aiPlaysBlack)
+                };
+            }
+
+            if (hasStableBest && bestMoves.Count > 1)
+            {
+                SnapshotMove chosen = bestMoves[0];
+                bestResult = new SnapshotSearchResult
+                {
+                    hasMove = true,
+                    startX = chosen.startX,
+                    startY = chosen.startY,
+                    targetX = chosen.targetX,
+                    targetY = chosen.targetY,
+                    score = bestResult.score
+                };
+            }
+
+            return bestResult;
+        }
+        finally
+        {
+            ReturnSnapshotMoveList(depthBestMoves);
+            ReturnSnapshotMoveList(bestMoves);
+            ReturnSnapshotMoveList(rootMoves);
+        }
+    }
+
+    private int MinimaxSnapshot(SnapshotSearchContext context, int depth, int alpha, int beta, bool whiteToMove, int ply, bool allowNullMove, ulong hash)
+    {
+        if (context.stopwatch.Elapsed.TotalSeconds >= context.deadlineSeconds)
+            return EvaluateSnapshot(context.board);
+
+        if (context.transpositionTable.TryGetValue(hash, out SnapshotTTEntry entry) && entry.depth >= depth)
+            return entry.score;
+
+        bool sideInCheck = IsKingInCheckSnapshot(context.board, whiteToMove);
+
+        if (depth <= 0)
+        {
+            if (!sideInCheck)
+                return EvaluateSnapshot(context.board);
+
+            depth = 1;
+        }
+
+        if (allowNullMove && depth >= 3 && !sideInCheck && HasNonPawnMaterialSnapshot(context.board, whiteToMove))
+        {
+            int nullScore = MinimaxSnapshot(context, depth - 1 - NullMoveReduction, alpha, beta, !whiteToMove, ply + 1, false, hash ^ snapshotSideToMoveKey);
+            if (!whiteToMove && nullScore >= beta)
+                return nullScore;
+
+            if (whiteToMove && nullScore <= alpha)
+                return nullScore;
+        }
+
+        bool isBlackMove = !whiteToMove;
+        List<SnapshotMove> moves = RentSnapshotMoveList();
+
+        try
+        {
+            CollectSnapshotMoves(moves, context.board, isBlackMove, capturesOnly: false, ply: ply, hash: hash, context: context);
+
+            if (moves.Count == 0)
+                return sideInCheck ? (whiteToMove ? MateScore : -MateScore) : 0;
+
+            moves.Sort((a, b) => b.score.CompareTo(a.score));
+
+            int bestScore = whiteToMove ? int.MinValue : int.MaxValue;
+
+            for (int i = 0; i < moves.Count; i++)
+            {
+                SnapshotMove move = moves[i];
+                SnapshotUndo undo;
+                ApplySnapshotMove(context.board, move, out undo);
+                ulong childHash = UpdateSnapshotHash(hash, move, undo, whiteToMove);
+
+                SnapshotPiece movedPieceAfter = context.board.pieces[move.targetX, move.targetY];
+                int movedPieceValue = GetSnapshotPieceValue(movedPieceAfter);
+                int tacticalSignal = EvaluateMovedPieceExposureSignalSnapshot(context.board, movedPieceAfter, move.targetX, move.targetY, movedIsBlack: isBlackMove,
+                    capturedValue: GetSnapshotPieceValue(undo.capturedPiece));
+
+                int nextDepth = depth - 1;
+                bool shouldExtend = ShouldExtendForExposureTrade(depth, ply, tacticalSignal, movedPieceValue, isCapture: undo.capturedPiece.type != ChessPieceType.None);
+                if (shouldExtend && (!context.highPerformanceMode || undo.capturedPiece.type != ChessPieceType.None))
+                    nextDepth = Mathf.Max(nextDepth, depth);
+
+                int score = MinimaxSnapshot(context, nextDepth, alpha, beta, !whiteToMove, ply + 1, true, childHash);
+                RevertSnapshotMove(context.board, move, undo);
+
+                if (whiteToMove)
+                {
+                    if (score > bestScore) bestScore = score;
+                    if (bestScore > alpha) alpha = bestScore;
+                }
+                else
+                {
+                    if (score < bestScore) bestScore = score;
+                    if (bestScore < beta) beta = bestScore;
+                }
+
+                if (beta <= alpha)
+                    break;
+            }
+
+            context.transpositionTable[hash] = new SnapshotTTEntry
+            {
+                depth = depth,
+                score = bestScore,
+                hasBestMove = false
+            };
+
+            return bestScore;
+        }
+        finally
+        {
+            ReturnSnapshotMoveList(moves);
+        }
+    }
+
+    private void CollectSnapshotMoves(List<SnapshotMove> result, BoardSnapshot board, bool isBlack, bool capturesOnly, int ply, ulong hash, SnapshotSearchContext context)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type == ChessPieceType.None || piece.isWhite == isBlack)
+                    continue;
+
+                AddSnapshotMovesForPiece(board, result, x, y, piece, capturesOnly, ply, hash, context);
+            }
+        }
+    }
+
+    private void AddSnapshotMovesForPiece(BoardSnapshot board, List<SnapshotMove> result, int startX, int startY, SnapshotPiece piece, bool capturesOnly, int ply, ulong hash, SnapshotSearchContext context)
+    {
+        switch (piece.type)
+        {
+            case ChessPieceType.Pawn:
+                AddPawnSnapshotMoves(board, result, startX, startY, piece, capturesOnly, ply, hash, context);
+                break;
+            case ChessPieceType.Knight:
+                AddKnightSnapshotMoves(board, result, startX, startY, piece, capturesOnly, ply, hash, context);
+                break;
+            case ChessPieceType.Bishop:
+                AddSlidingSnapshotMoves(board, result, startX, startY, piece, capturesOnly, ply, hash, context, new int[,] { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } });
+                break;
+            case ChessPieceType.Rook:
+                AddSlidingSnapshotMoves(board, result, startX, startY, piece, capturesOnly, ply, hash, context, new int[,] { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } });
+                break;
+            case ChessPieceType.Queen:
+                AddSlidingSnapshotMoves(board, result, startX, startY, piece, capturesOnly, ply, hash, context, new int[,] { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } });
+                break;
+            case ChessPieceType.King:
+                AddKingSnapshotMoves(board, result, startX, startY, piece, capturesOnly, ply, hash, context);
+                break;
+        }
+    }
+
+    private void AddPawnSnapshotMoves(BoardSnapshot board, List<SnapshotMove> result, int startX, int startY, SnapshotPiece piece, bool capturesOnly, int ply, ulong hash, SnapshotSearchContext context)
+    {
+        int direction = piece.isWhite ? 1 : -1;
+        int startRow = piece.isWhite ? 1 : 6;
+        int forwardY = startY + direction;
+
+        if (!capturesOnly && IsOnBoard(startX, forwardY) && board.pieces[startX, forwardY].type == ChessPieceType.None)
+        {
+            AddIfLegalSnapshotMove(board, result, startX, startY, startX, forwardY, piece, capturesOnly, ply, hash, context);
+
+            int doubleY = startY + direction * 2;
+            if (startY == startRow && IsOnBoard(startX, doubleY) && board.pieces[startX, doubleY].type == ChessPieceType.None)
+                AddIfLegalSnapshotMove(board, result, startX, startY, startX, doubleY, piece, capturesOnly, ply, hash, context);
+        }
+
+        for (int dx = -1; dx <= 1; dx += 2)
+        {
+            int targetX = startX + dx;
+            int targetY = startY + direction;
+            if (!IsOnBoard(targetX, targetY))
+                continue;
+
+            SnapshotPiece target = board.pieces[targetX, targetY];
+            if (target.type == ChessPieceType.None || target.isWhite == piece.isWhite)
+                continue;
+
+            AddIfLegalSnapshotMove(board, result, startX, startY, targetX, targetY, piece, capturesOnly, ply, hash, context);
+        }
+    }
+
+    private void AddKnightSnapshotMoves(BoardSnapshot board, List<SnapshotMove> result, int startX, int startY, SnapshotPiece piece, bool capturesOnly, int ply, ulong hash, SnapshotSearchContext context)
+    {
+        int[,] offsets = new int[,] { { 1, 2 }, { 2, 1 }, { -1, 2 }, { -2, 1 }, { 1, -2 }, { 2, -1 }, { -1, -2 }, { -2, -1 } };
+        for (int i = 0; i < 8; i++)
+        {
+            int targetX = startX + offsets[i, 0];
+            int targetY = startY + offsets[i, 1];
+            if (!IsOnBoard(targetX, targetY))
+                continue;
+
+            SnapshotPiece target = board.pieces[targetX, targetY];
+            if (target.type != ChessPieceType.None && target.isWhite == piece.isWhite)
+                continue;
+
+            if (capturesOnly && target.type == ChessPieceType.None)
+                continue;
+
+            AddIfLegalSnapshotMove(board, result, startX, startY, targetX, targetY, piece, capturesOnly, ply, hash, context);
+        }
+    }
+
+    private void AddSlidingSnapshotMoves(BoardSnapshot board, List<SnapshotMove> result, int startX, int startY, SnapshotPiece piece, bool capturesOnly, int ply, ulong hash, SnapshotSearchContext context, int[,] directions)
+    {
+        for (int i = 0; i < directions.GetLength(0); i++)
+        {
+            int dx = directions[i, 0];
+            int dy = directions[i, 1];
+            int targetX = startX + dx;
+            int targetY = startY + dy;
+
+            while (IsOnBoard(targetX, targetY))
+            {
+                SnapshotPiece target = board.pieces[targetX, targetY];
+                if (target.type != ChessPieceType.None && target.isWhite == piece.isWhite)
+                    break;
+
+                if (!capturesOnly || target.type != ChessPieceType.None)
+                    AddIfLegalSnapshotMove(board, result, startX, startY, targetX, targetY, piece, capturesOnly, ply, hash, context);
+
+                if (target.type != ChessPieceType.None)
+                    break;
+
+                targetX += dx;
+                targetY += dy;
+            }
+        }
+    }
+
+    private void AddKingSnapshotMoves(BoardSnapshot board, List<SnapshotMove> result, int startX, int startY, SnapshotPiece piece, bool capturesOnly, int ply, ulong hash, SnapshotSearchContext context)
+    {
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                if (dx == 0 && dy == 0)
+                    continue;
+
+                int targetX = startX + dx;
+                int targetY = startY + dy;
+                if (!IsOnBoard(targetX, targetY))
+                    continue;
+
+                SnapshotPiece target = board.pieces[targetX, targetY];
+                if (target.type != ChessPieceType.None && target.isWhite == piece.isWhite)
+                    continue;
+
+                if (capturesOnly && target.type == ChessPieceType.None)
+                    continue;
+
+                AddIfLegalSnapshotMove(board, result, startX, startY, targetX, targetY, piece, capturesOnly, ply, hash, context);
+            }
+        }
+    }
+
+    private void AddIfLegalSnapshotMove(BoardSnapshot board, List<SnapshotMove> result, int startX, int startY, int targetX, int targetY, SnapshotPiece piece, bool capturesOnly, int ply, ulong hash, SnapshotSearchContext context)
+    {
+        SnapshotMove move = new SnapshotMove
+        {
+            startX = startX,
+            startY = startY,
+            targetX = targetX,
+            targetY = targetY,
+            score = GetSnapshotMoveOrderingScore(board, piece, startX, startY, targetX, targetY, capturesOnly, ply)
+        };
+
+        SnapshotUndo undo;
+        ApplySnapshotMove(board, move, out undo);
+        bool legal = !IsKingInCheckSnapshot(board, piece.isWhite);
+        RevertSnapshotMove(board, move, undo);
+
+        if (legal)
+            result.Add(move);
+    }
+
+    private int GetSnapshotMoveOrderingScore(BoardSnapshot board, SnapshotPiece piece, int startX, int startY, int targetX, int targetY, bool capturesOnly, int ply)
+    {
+        int score = GetSnapshotPieceValue(board.pieces[targetX, targetY]) * 12;
+        if (score > 0)
+            score += 10000;
+
+        if (!capturesOnly)
+            score += GetCenterControlScore(targetX, targetY);
+
+        if (piece.type == ChessPieceType.King)
+            score -= 25;
+
+        return score;
+    }
+
+    private static bool IsOnBoard(int x, int y)
+    {
+        return x >= 0 && x < BoardSize && y >= 0 && y < BoardSize;
+    }
+
+    private void ApplySnapshotMove(BoardSnapshot board, SnapshotMove move, out SnapshotUndo undo)
+    {
+        SnapshotPiece movingPiece = board.pieces[move.startX, move.startY];
+        SnapshotPiece capturedPiece = board.pieces[move.targetX, move.targetY];
+
+        undo = new SnapshotUndo
+        {
+            movingPiece = movingPiece,
+            capturedPiece = capturedPiece
+        };
+
+        movingPiece.hasMoved = true;
+        if (movingPiece.type == ChessPieceType.Pawn)
+        {
+            if ((movingPiece.isWhite && move.targetY == BoardSize - 1) || (!movingPiece.isWhite && move.targetY == 0))
+                movingPiece.type = ChessPieceType.Queen;
+        }
+
+        board.pieces[move.targetX, move.targetY] = movingPiece;
+        board.pieces[move.startX, move.startY] = default;
+    }
+
+    private void RevertSnapshotMove(BoardSnapshot board, SnapshotMove move, SnapshotUndo undo)
+    {
+        board.pieces[move.startX, move.startY] = undo.movingPiece;
+        board.pieces[move.targetX, move.targetY] = undo.capturedPiece;
+    }
+
+    private ulong ComputeSnapshotHash(BoardSnapshot board, bool whiteToMove)
+    {
+        unchecked
+        {
+            ulong hash = 1469598103934665603UL;
+
+            for (int x = 0; x < BoardSize; x++)
+            {
+                for (int y = 0; y < BoardSize; y++)
+                {
+                    SnapshotPiece piece = board.pieces[x, y];
+                    int index = GetSnapshotPieceIndex(piece);
+                    if (index == 0)
+                        continue;
+
+                    hash ^= GetSnapshotZobristKey(x, y, index);
+                    hash *= 1099511628211UL;
+                }
+            }
+
+            if (whiteToMove)
+            {
+                hash ^= snapshotSideToMoveKey;
+                hash *= 1099511628211UL;
+            }
+
+            return hash;
+        }
+    }
+
+    private ulong UpdateSnapshotHash(ulong hash, SnapshotMove move, SnapshotUndo undo, bool whiteToMove)
+    {
+        SnapshotPiece movingAfter = undo.movingPiece;
+        movingAfter.hasMoved = true;
+        if (movingAfter.type == ChessPieceType.Pawn)
+        {
+            if ((movingAfter.isWhite && move.targetY == BoardSize - 1) || (!movingAfter.isWhite && move.targetY == 0))
+                movingAfter.type = ChessPieceType.Queen;
+        }
+
+        int startIndex = GetSnapshotPieceIndex(undo.movingPiece);
+        int targetIndex = GetSnapshotPieceIndex(undo.capturedPiece);
+        int movedIndex = GetSnapshotPieceIndex(movingAfter);
+
+        unchecked
+        {
+            hash ^= GetSnapshotZobristKey(move.startX, move.startY, startIndex);
+            if (targetIndex != 0)
+                hash ^= GetSnapshotZobristKey(move.targetX, move.targetY, targetIndex);
+            hash ^= GetSnapshotZobristKey(move.targetX, move.targetY, movedIndex);
+            hash ^= snapshotSideToMoveKey;
+        }
+
+        return hash;
+    }
+
+    private int GetSnapshotPieceValue(SnapshotPiece piece)
+    {
+        switch (piece.type)
+        {
+            case ChessPieceType.Pawn: return 10;
+            case ChessPieceType.Knight: return 30;
+            case ChessPieceType.Bishop: return 30;
+            case ChessPieceType.Rook: return 50;
+            case ChessPieceType.Queen: return 90;
+            case ChessPieceType.King: return 900;
+            default: return 0;
+        }
+    }
+
+    private int GetSnapshotPositionalScore(SnapshotPiece piece, int x, int y)
+    {
+        int bonus = GetCenterControlScore(x, y);
+
+        switch (piece.type)
+        {
+            case ChessPieceType.Pawn: return bonus + 5;
+            case ChessPieceType.Knight: return bonus + 10;
+            case ChessPieceType.Bishop: return bonus + 8;
+            case ChessPieceType.Rook: return bonus + 6;
+            case ChessPieceType.Queen: return bonus + 4;
+            case ChessPieceType.King: return -Math.Abs(x - 3) - Math.Abs(y - 3);
+            default: return 0;
+        }
+    }
+
+    private int EvaluateSnapshot(BoardSnapshot board)
+    {
+        int total = 0;
+        int nonKingMaterial = 0;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type == ChessPieceType.None)
+                    continue;
+
+                int value = GetSnapshotPieceValue(piece) + GetSnapshotPositionalScore(piece, x, y);
+                total += piece.isWhite ? -value : value;
+
+                if (piece.type != ChessPieceType.King)
+                    nonKingMaterial += GetSnapshotPieceValue(piece);
+            }
+        }
+
+        total += EvaluatePawnStructureSnapshot(board, true);
+        total -= EvaluatePawnStructureSnapshot(board, false);
+        total += EvaluateKingSafetySnapshot(board, true);
+        total -= EvaluateKingSafetySnapshot(board, false);
+
+        float endgameT = Mathf.Clamp01(1f - (nonKingMaterial / 780f));
+        total += EvaluatePieceSafetySnapshot(board, true, endgameT);
+        total -= EvaluatePieceSafetySnapshot(board, false, endgameT);
+        total += EvaluateKingActivitySnapshot(board, true, endgameT);
+        total -= EvaluateKingActivitySnapshot(board, false, endgameT);
+
+        return total;
+    }
+
+    private int EvaluatePawnStructureSnapshot(BoardSnapshot board, bool isBlack)
+    {
+        int[] pawnFiles = new int[BoardSize];
+        var pawns = new List<Vector2Int>(8);
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type != ChessPieceType.Pawn || piece.isWhite == isBlack)
+                    continue;
+
+                pawnFiles[x]++;
+                pawns.Add(new Vector2Int(x, y));
+            }
+        }
+
+        int score = 0;
+        for (int file = 0; file < BoardSize; file++)
+        {
+            if (pawnFiles[file] > 1)
+                score -= (pawnFiles[file] - 1) * 4;
+        }
+
+        for (int i = 0; i < pawns.Count; i++)
+        {
+            int x = pawns[i].x;
+            int y = pawns[i].y;
+
+            bool hasLeftSupport = x > 0 && pawnFiles[x - 1] > 0;
+            bool hasRightSupport = x < BoardSize - 1 && pawnFiles[x + 1] > 0;
+            if (!hasLeftSupport && !hasRightSupport)
+                score -= 3;
+
+            if (IsPassedPawnSnapshot(board, isBlack, x, y))
+            {
+                int progress = isBlack ? (BoardSize - 1 - y) : y;
+                score += 4 + progress * 2;
+            }
+        }
+
+        return score;
+    }
+
+    private bool IsPassedPawnSnapshot(BoardSnapshot board, bool isBlack, int pawnX, int pawnY)
+    {
+        for (int ex = pawnX - 1; ex <= pawnX + 1; ex++)
+        {
+            if (ex < 0 || ex >= BoardSize)
+                continue;
+
+            if (isBlack)
+            {
+                for (int ey = pawnY - 1; ey >= 0; ey--)
+                {
+                    SnapshotPiece enemy = board.pieces[ex, ey];
+                    if (enemy.type == ChessPieceType.Pawn && !enemy.isWhite)
+                        return false;
+                }
+            }
+            else
+            {
+                for (int ey = pawnY + 1; ey < BoardSize; ey++)
+                {
+                    SnapshotPiece enemy = board.pieces[ex, ey];
+                    if (enemy.type == ChessPieceType.Pawn && enemy.isWhite)
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private bool TryFindKingSnapshot(BoardSnapshot board, bool isBlack, out int kingX, out int kingY)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type != ChessPieceType.King)
+                    continue;
+
+                if (piece.isWhite == isBlack)
+                    continue;
+
+                kingX = x;
+                kingY = y;
+                return true;
+            }
+        }
+
+        kingX = -1;
+        kingY = -1;
+        return false;
+    }
+
+    private bool IsKingInCheckSnapshot(BoardSnapshot board, bool white)
+    {
+        if (!TryFindKingSnapshot(board, !white, out int kingX, out int kingY))
+            return false;
+
+        return IsSquareAttackedSnapshot(board, kingX, kingY, white);
+    }
+
+    private bool IsSquareAttackedSnapshot(BoardSnapshot board, int targetX, int targetY, bool byBlack)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type == ChessPieceType.None || piece.isWhite == byBlack)
+                    continue;
+
+                if (AttacksSquareSnapshot(board, piece, x, y, targetX, targetY))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool AttacksSquareSnapshot(BoardSnapshot board, SnapshotPiece piece, int startX, int startY, int targetX, int targetY)
+    {
+        int deltaX = targetX - startX;
+        int deltaY = targetY - startY;
+
+        switch (piece.type)
+        {
+            case ChessPieceType.Pawn:
+                return deltaY == (piece.isWhite ? 1 : -1) && Math.Abs(deltaX) == 1;
+            case ChessPieceType.Knight:
+                return (Math.Abs(deltaX) == 1 && Math.Abs(deltaY) == 2) || (Math.Abs(deltaX) == 2 && Math.Abs(deltaY) == 1);
+            case ChessPieceType.Bishop:
+                if (Math.Abs(deltaX) != Math.Abs(deltaY)) return false;
+                return IsPathClearSnapshot(board, startX, startY, targetX, targetY);
+            case ChessPieceType.Rook:
+                if (deltaX != 0 && deltaY != 0) return false;
+                return IsPathClearSnapshot(board, startX, startY, targetX, targetY);
+            case ChessPieceType.Queen:
+                if (deltaX == 0 || deltaY == 0 || Math.Abs(deltaX) == Math.Abs(deltaY))
+                    return IsPathClearSnapshot(board, startX, startY, targetX, targetY);
+                return false;
+            case ChessPieceType.King:
+                return Math.Abs(deltaX) <= 1 && Math.Abs(deltaY) <= 1;
+            default:
+                return false;
+        }
+    }
+
+    private bool IsPathClearSnapshot(BoardSnapshot board, int startX, int startY, int targetX, int targetY)
+    {
+        int stepX = Math.Sign(targetX - startX);
+        int stepY = Math.Sign(targetY - startY);
+        int x = startX + stepX;
+        int y = startY + stepY;
+
+        while (x != targetX || y != targetY)
+        {
+            if (board.pieces[x, y].type != ChessPieceType.None)
+                return false;
+
+            x += stepX;
+            y += stepY;
+        }
+
+        return true;
+    }
+
+    private bool HasNonPawnMaterialSnapshot(BoardSnapshot board, bool white)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type == ChessPieceType.None || piece.isWhite != white)
+                    continue;
+
+                if (piece.type != ChessPieceType.Pawn && piece.type != ChessPieceType.King)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private int EvaluateKingSafetySnapshot(BoardSnapshot board, bool isBlack)
+    {
+        if (!TryFindKingSnapshot(board, isBlack, out int kingX, out int kingY))
+            return 0;
+
+        int attackers = 0;
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                int nx = kingX + dx;
+                int ny = kingY + dy;
+                if (!IsOnBoard(nx, ny))
+                    continue;
+
+                if (IsSquareAttackedSnapshot(board, nx, ny, !isBlack))
+                    attackers++;
+            }
+        }
+
+        int score = -attackers * 3;
+        int pawnShieldY = isBlack ? kingY - 1 : kingY + 1;
+        if (IsOnBoard(kingX, pawnShieldY))
+        {
+            for (int sx = kingX - 1; sx <= kingX + 1; sx++)
+            {
+                if (!IsOnBoard(sx, pawnShieldY))
+                    continue;
+
+                SnapshotPiece shield = board.pieces[sx, pawnShieldY];
+                if (shield.type == ChessPieceType.Pawn && shield.isWhite != isBlack)
+                    score += 2;
+            }
+        }
+
+        return score;
+    }
+
+    private int CountAttackersSnapshot(BoardSnapshot board, int targetX, int targetY, bool byBlack, out int lowestAttackerValue)
+    {
+        int count = 0;
+        lowestAttackerValue = int.MaxValue;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type == ChessPieceType.None)
+                    continue;
+
+                bool sameSide = byBlack ? !piece.isWhite : piece.isWhite;
+                if (!sameSide)
+                    continue;
+
+                if (!AttacksSquareSnapshot(board, piece, x, y, targetX, targetY))
+                    continue;
+
+                count++;
+                int value = GetSnapshotPieceValue(piece);
+                if (value < lowestAttackerValue)
+                    lowestAttackerValue = value;
+            }
+        }
+
+        if (count == 0)
+            lowestAttackerValue = 0;
+
+        return count;
+    }
+
+    private int CountDefendersSnapshot(BoardSnapshot board, int targetX, int targetY, bool isBlack, int excludeX, int excludeY)
+    {
+        int count = 0;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                if (x == excludeX && y == excludeY)
+                    continue;
+
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type == ChessPieceType.None)
+                    continue;
+
+                bool sameSide = isBlack ? !piece.isWhite : piece.isWhite;
+                if (!sameSide)
+                    continue;
+
+                if (AttacksSquareSnapshot(board, piece, x, y, targetX, targetY))
+                    count++;
+            }
+        }
+
+        return count;
+    }
+
+    private int EvaluatePieceSafetySnapshot(BoardSnapshot board, bool isBlack, float endgameT)
+    {
+        int score = 0;
+        float endgameFactor = Mathf.Lerp(1f, 1f - PieceSafetyEndgameFade, Mathf.Clamp01(endgameT));
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                SnapshotPiece piece = board.pieces[x, y];
+                if (piece.type == ChessPieceType.None || piece.type == ChessPieceType.King)
+                    continue;
+
+                bool sameSide = isBlack ? !piece.isWhite : piece.isWhite;
+                if (!sameSide)
+                    continue;
+
+                int pieceValue = GetSnapshotPieceValue(piece);
+                int attackers = CountAttackersSnapshot(board, x, y, byBlack: !isBlack, out int lowestAttackerValue);
+                if (attackers == 0)
+                    continue;
+
+                int defenders = CountDefendersSnapshot(board, x, y, isBlack, x, y);
+                int imbalance = Mathf.Max(0, attackers - defenders);
+
+                int penalty = imbalance * Mathf.Max(2, pieceValue / 6);
+                if (defenders == 0)
+                    penalty += Mathf.RoundToInt(Mathf.Max(2, pieceValue / 4) * UndefendedPenaltyBoost);
+
+                if (lowestAttackerValue > 0 && lowestAttackerValue < pieceValue)
+                    penalty += Mathf.Max(1, (pieceValue - lowestAttackerValue) / 5);
+
+                penalty = Mathf.RoundToInt(penalty * PieceSafetyGlobalWeight * endgameFactor);
+
+                score -= penalty;
+            }
+        }
+
+        return score;
+    }
+
+    private int EvaluateMovedPieceExposureSignalSnapshot(BoardSnapshot board, SnapshotPiece movedPiece, int targetX, int targetY, bool movedIsBlack,
+        int capturedValue)
+    {
+        if (movedPiece.type == ChessPieceType.None)
+            return capturedValue;
+
+        int pieceValue = GetSnapshotPieceValue(movedPiece);
+        if (pieceValue <= 0)
+            return capturedValue;
+
+        int attackers = CountAttackersSnapshot(board, targetX, targetY, byBlack: !movedIsBlack, out int lowestAttackerValue);
+        if (attackers == 0)
+            return capturedValue;
+
+        int defenders = CountDefendersSnapshot(board, targetX, targetY, movedIsBlack, targetX, targetY);
+        int imbalance = Mathf.Max(0, attackers - defenders);
+
+        int penalty = imbalance * Mathf.Max(2, pieceValue / 6);
+        if (defenders == 0)
+            penalty += Mathf.RoundToInt(Mathf.Max(2, pieceValue / 4) * UndefendedPenaltyBoost);
+
+        if (lowestAttackerValue > 0 && lowestAttackerValue < pieceValue)
+            penalty += Mathf.Max(1, (pieceValue - lowestAttackerValue) / 5);
+
+        return capturedValue - penalty;
+    }
+
+    private int EvaluateKingActivitySnapshot(BoardSnapshot board, bool isBlack, float endgameT)
+    {
+        if (endgameT <= 0.01f || !TryFindKingSnapshot(board, isBlack, out int kingX, out int kingY))
+            return 0;
+
+        int center = GetCenterControlScore(kingX, kingY);
+        return Mathf.RoundToInt(center * endgameT * 2.5f);
+    }
+}
