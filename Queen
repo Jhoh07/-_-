@@ -1,30 +1,33 @@
 using UnityEngine;
-public class Rook : ChessPiece
+public class Queen : ChessPiece
 {
-    public override ChessPieceType PieceType => ChessPieceType.Rook;
+    public override ChessPieceType PieceType => ChessPieceType.Queen;
 
     public override bool IsValidMove(int startX, int startY, int targetX, int targetY, GameObject[,] boardPieces)
     {
-        if (startX != targetX && startY != targetY) return false;
+        int deltaX = Mathf.Abs(targetX - startX);
+        int deltaY = Mathf.Abs(targetY - startY);
 
-        if (startY == targetY)
-        {
-            int minX = Mathf.Min(startX, targetX) + 1;
-            int maxX = Mathf.Max(startX, targetX) - 1;
-            for (int x = minX; x <= maxX; x++)
-                if (boardPieces[x, startY] != null) return false;
+        if (startX == targetX || startY == targetY) {
+            if (startY == targetY) {
+                int minX = Mathf.Min(startX, targetX) + 1; int maxX = Mathf.Max(startX, targetX) - 1;
+                for (int x = minX; x <= maxX; x++) if (boardPieces[x, startY] != null) return false;
+                return true;
+            }
+            if (startX == targetX) {
+                int minY = Mathf.Min(startY, targetY) + 1; int maxY = Mathf.Max(startY, targetY) - 1;
+                for (int y = minY; y <= maxY; y++) if (boardPieces[startX, y] != null) return false;
+                return true;
+            }
+        } else if (deltaX == deltaY) {
+            int xDir = (targetX > startX) ? 1 : -1; int yDir = (targetY > startY) ? 1 : -1;
+            int checkX = startX + xDir; int checkY = startY + yDir;
+            while (checkX != targetX && checkY != targetY) {
+                if (boardPieces[checkX, checkY] != null) return false;
+                checkX += xDir; checkY += yDir;
+            }
             return true;
         }
-
-        if (startX == targetX)
-        {
-            int minY = Mathf.Min(startY, targetY) + 1;
-            int maxY = Mathf.Max(startY, targetY) - 1;
-            for (int y = minY; y <= maxY; y++)
-                if (boardPieces[startX, y] != null) return false;
-            return true;
-        }
-
         return false;
     }
 }
