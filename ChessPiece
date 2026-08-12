@@ -1,0 +1,25 @@
+using UnityEngine;
+
+public enum ChessPieceType
+{
+    None,
+    Pawn,
+    Knight,
+    Bishop,
+    Rook,
+    Queen,
+    King
+}
+
+public abstract class ChessPiece : MonoBehaviour
+{
+    [HideInInspector] 
+    public bool isWhite; 
+    [HideInInspector] 
+    public bool hasMoved = false;
+
+    public abstract ChessPieceType PieceType { get; }
+
+    // 🌟 자식 클래스들이 무조건 덮어써야(override) 하는 핵심 이동 규칙 함수!
+    public abstract bool IsValidMove(int startX, int startY, int targetX, int targetY, GameObject[,] boardPieces);
+}
