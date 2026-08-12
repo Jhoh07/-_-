@@ -1,0 +1,63 @@
+using UnityEngine;
+
+public class CardKeyboardSelector : MonoBehaviour
+{
+    private RectTransform rectTransform;
+    private Vector2 originalPos;
+
+    [Header("카드 데이터")]
+    public CardData cardData;
+    
+    [Header("키보드 설정")]
+    public KeyCode assignKey = KeyCode.Q; 
+
+    [Header("이동 셋팅")]
+    public float hoverOffsetY = 50f; // 위로 튀어오르는 높이
+
+    [HideInInspector] public bool isSelected = false;
+    private bool isInitialized = false;
+
+    void Start()
+    {
+        rectTransform = GetComponent<RectTransform>();
+        Invoke("SaveStartPosition", 0.1f);
+    }
+
+    void SaveStartPosition()
+    {
+        originalPos = rectTransform.anchoredPosition;
+        isInitialized = true;
+    }
+
+    public void DeselectCard()
+    {
+        isSelected = false;
+        ApplyPosition(); // 상태 변경 즉시 적용
+    }
+
+    public void SelectCard()
+    {
+        isSelected = true;
+        transform.SetAsLastSibling(); // 맨 앞으로 가져오기
+        ApplyPosition(); // 상태 변경 즉시 적용
+    }
+
+    // 애니메이션(Lerp) 없이 즉시 위치를 확정하는 함수
+    void ApplyPosition()
+    {
+        if (!isInitialized) return;
+
+        Vector2 targetPos = originalPos;
+        if (isSelected)
+        {
+            targetPos.y += hoverOffsetY;
+        }
+        rectTransform.anchoredPosition = targetPos;
+    }
+
+    // Update 문에서 애니메이션 코드를 완전히 제거했습니다!
+    void Update()
+    {
+        // 실시간 연산이 필요 없으므로 비워둡니다.
+    }
+}
