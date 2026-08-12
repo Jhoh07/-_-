@@ -1,0 +1,93 @@
+using UnityEngine;
+
+public class ChessBoard : MonoBehaviour
+{
+    public Grid gameGrid;
+    
+    [Header("기물 프리팹(Prefabs)")]
+    public GameObject WhitePawnPrefab; public GameObject BlackPawnPrefab;
+    public GameObject WhiteRookPrefab; public GameObject BlackRookPrefab;
+    public GameObject WhiteKnightPrefab; public GameObject BlackKnightPrefab;
+    public GameObject WhiteBishopPrefab; public GameObject BlackBishopPrefab;
+    public GameObject WhiteQueenPrefab; public GameObject BlackQueenPrefab;
+    public GameObject WhiteKingPrefab; public GameObject BlackKingPrefab;
+
+    // 체스판의 상태를 저장하는 핵심 데이터
+    public GameObject[,] pieces = new GameObject[8, 8];
+
+    // 매니저가 게임을 시작할 때 호출할 초기화 함수
+    public void InitializeBoard()
+    {
+        if (gameGrid == null) gameGrid = GetComponent<Grid>();
+        SpawnAllPieces();
+    }
+
+    private const int BoardSize = 8;
+
+    void SpawnAllPieces()
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            SpawnSinglePiece(WhitePawnPrefab, true, x, 1);
+            SpawnSinglePiece(BlackPawnPrefab, false, x, 6);
+        }
+
+        SpawnSinglePiece(WhiteRookPrefab, true, 0, 0);
+        SpawnSinglePiece(WhiteRookPrefab, true, 7, 0);
+        SpawnSinglePiece(BlackRookPrefab, false, 0, 7);
+        SpawnSinglePiece(BlackRookPrefab, false, 7, 7);
+
+        SpawnSinglePiece(WhiteKnightPrefab, true, 1, 0);
+        SpawnSinglePiece(WhiteKnightPrefab, true, 6, 0);
+        SpawnSinglePiece(BlackKnightPrefab, false, 1, 7);
+        SpawnSinglePiece(BlackKnightPrefab, false, 6, 7);
+
+        SpawnSinglePiece(WhiteBishopPrefab, true, 2, 0);
+        SpawnSinglePiece(WhiteBishopPrefab, true, 5, 0);
+        SpawnSinglePiece(BlackBishopPrefab, false, 2, 7);
+        SpawnSinglePiece(BlackBishopPrefab, false, 5, 7);
+
+        SpawnSinglePiece(WhiteQueenPrefab, true, 3, 0);
+        SpawnSinglePiece(WhiteKingPrefab, true, 4, 0);
+        SpawnSinglePiece(BlackQueenPrefab, false, 3, 7);
+        SpawnSinglePiece(BlackKingPrefab, false, 4, 7);
+    }
+
+    void SpawnSinglePiece(GameObject prefab, bool isWhite, int x, int y)
+    {
+        Vector3 spawnPos = GetWorldPositionFromBoard(x, y);
+        GameObject newPiece = Instantiate(prefab, spawnPos, Quaternion.identity);
+        newPiece.transform.SetParent(this.transform);
+
+        ChessPiece chessPiece = newPiece.GetComponent<ChessPiece>();
+        if (chessPiece != null)
+            chessPiece.isWhite = isWhite;
+
+        pieces[x, y] = newPiece; 
+    }
+
+    // 물리적인 이동 처리
+    public void UpdatePiecePosition(GameObject piece, int x, int y) 
+    {
+        if (piece == null || gameGrid == null) return;
+        Vector3 worldPos = GetWorldPositionFromBoard(x, y);
+        piece.transform.position = new Vector3(worldPos.x, worldPos.y, piece.transform.position.z);
+    }
+
+    // 좌표 변환 도우미 함수들
+    public Vector3 GetWorldPositionFromBoard(int x, int y) 
+    {
+        Vector3Int cellPosition = new Vector3Int(x, y, 0);
+        return gameGrid.GetCellCenterWorld(cellPosition);
+    }
+
+    public Vector3Int GetCellPositionFromWorld(Vector3 worldPos)
+    {
+        return gameGrid.WorldToCell(worldPos);
+    }
+
+    public bool IsPositionOnBoard(int x, int y) 
+    { 
+        return x >= 0 && x < 8 && y >= 0 && y < 8; 
+    }
+}
