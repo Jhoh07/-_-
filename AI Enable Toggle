@@ -1,0 +1,32 @@
+using UnityEngine;
+using UnityEngine.UI;
+
+public class AIEnableToggle : MonoBehaviour
+{
+    public Toggle aiToggle;
+    public ChessAI chessAI;
+
+    void Start()
+    {
+        if (aiToggle == null || chessAI == null)
+        {
+            Debug.LogError("AIEnableToggle: aiToggle 또는 chessAI가 설정되지 않았습니다.");
+            enabled = false;
+            return;
+        }
+
+        aiToggle.isOn = chessAI.aiEnabled;
+        aiToggle.onValueChanged.AddListener(OnToggleChanged);
+    }
+
+    void OnToggleChanged(bool isOn)
+    {
+        chessAI.SetAIEnabled(isOn);
+    }
+
+    void OnDestroy()
+    {
+        if (aiToggle != null)
+            aiToggle.onValueChanged.RemoveListener(OnToggleChanged);
+    }
+}
