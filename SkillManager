@@ -1,0 +1,67 @@
+using UnityEngine;
+
+public class SkillManager : MonoBehaviour
+{
+    [Header("연결할 매니저")]
+    public CardManager cardManager; 
+
+    void Update()
+    {
+        // 🚀 테스트: 스페이스바를 누르면 현재 튀어나온 카드의 스킬을 발동시켜 봅니다!
+        // (나중에는 스페이스바 대신 체스판을 클릭했을 때 작동하게 바꿀 겁니다)
+        if (Input.GetKeyDown(KeyCode.F))
+        {
+            TryExecuteSkill();
+        }
+    }
+
+    void TryExecuteSkill()
+    {
+        if (cardManager == null) return;
+
+        // CardManager에게 "지금 위로 솟아있는 카드가 누구야?" 하고 물어봅니다.
+        CardData selectedCardData = cardManager.GetSelectedCardData();
+
+        if (selectedCardData == null)
+        {
+            Debug.Log("❌ 위로 튀어나온 카드가 없습니다! 카드를 먼저 선택해 주세요.");
+            return;
+        }
+
+        Debug.Log($"🃏 [{selectedCardData.cardName}] 카드를 사용합니다!");
+        ExecuteSkillEffect(selectedCardData.skillType);
+    }
+
+    // 스킬 종류에 따라 실제 기능이 갈라지는 핵심 장소입니다.
+    void ExecuteSkillEffect(SkillType skill)
+    {
+        switch (skill)
+        {
+            case SkillType.독심술:
+                Debug.Log("💜 [허밋 퍼플 발동] : 상대 말 1개를 조종할 준비가 되었습니다!");
+                break;
+            case SkillType.로드롤러:
+                Debug.Log("🚜 [더 월드 발동] : 지정한 칸을 1턴 뒤 뭉개버립니다. WRYYYY!");
+                break;
+            case SkillType.오라오라_러쉬:
+                Debug.Log("👊 [스타 플래티나 발동] : 오라오라오라오라! 정면의 적을 분쇄합니다!");
+                break;
+            case SkillType.에메랄드_스플래쉬:
+                Debug.Log("💎 [하이에로팬트 그린 발동] : 닿아라! 에메랄드 스플래쉬!");
+                break;
+            case SkillType.크로스파이어_허리케인:
+                Debug.Log("🔥 [매지션즈 레드 발동] : 십자 폭발로 불태웁니다!");
+                break;
+            case SkillType.더_풀:
+                Debug.Log("⏳ [더 풀 발동] : 1턴 동안 아군 말에게 절대 무적을 부여합니다!");
+                break;
+            case SkillType.러쉬:
+                Debug.Log("⚔️ [실버 채리엇 발동] : 갑옷을 벗고 3턴 연속으로 이동합니다!");
+                break;
+            case SkillType.none:
+            default:
+                Debug.Log("효과가 없는 일반 카드입니다.");
+                break;
+        }
+    }
+}
