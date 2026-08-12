@@ -1,0 +1,100 @@
+using UnityEngine;
+using System.Collections.Generic;
+
+public class CardManager : MonoBehaviour
+{
+    [Header("카드 세팅")]
+    public GameObject defaultCardPrefab; 
+    public Transform handPanel;   
+
+    [Header("내 덱(Deck) 설정")]
+    public List<CardData> deck = new List<CardData>();
+    public int startingHandSize = 5; 
+
+    // 매니저가 손패에 있는 카드들을 기억하는 리스트입니다.
+    private List<CardKeyboardSelector> spawnedCards = new List<CardKeyboardSelector>();
+
+    void Start()
+    {
+        DrawMultipleCards(startingHandSize);
+    }
+
+    void Update()
+    {
+        KeyCode[] keys = { KeyCode.Q, KeyCode.W, KeyCode.E, KeyCode.R, KeyCode.T };
+
+        for (int i = 0; i < keys.Length; i++)
+        {
+            if (Input.GetKeyDown(keys[i]))
+            {
+                HandleCardKeyInput(keys[i]);
+            }
+        }
+    }
+
+    void HandleCardKeyInput(KeyCode pressedKey)
+    {
+        foreach (var card in spawnedCards)
+        {
+            if (card == null) continue;
+
+            if (card.assignKey == pressedKey)
+            {
+                if (card.isSelected)
+                {
+                    card.DeselectCard();
+                }
+                else
+                {
+                    foreach (var other in spawnedCards)
+                    {
+                        if (other != null) other.DeselectCard();
+                    }
+                    card.SelectCard();
+                }
+            }
+        }
+    }
+
+    public void DrawMultipleCards(int amount)
+    {
+        spawnedCards.Clear(); 
+        KeyCode[] keys = { KeyCode.Q, KeyCode.W, KeyCode.E, KeyCode.R, KeyCode.T };
+
+        for (int i = 0; i < amount; i++)
+        {
+            if (deck.Count == 0) return;
+
+            int randomIndex = Random.Range(0, deck.Count);
+            CardData drawnCardData = deck[randomIndex];
+
+            GameObject prefabToUse = drawnCardData.customPrefab != null ? drawnCardData.customPrefab : defaultCardPrefab;
+            GameObject newCard = Instantiate(prefabToUse, handPanel);
+            
+            CardKeyboardSelector selector = newCard.GetComponent<CardKeyboardSelector>();
+            if (selector != null && i < keys.Length)
+            {
+                selector.assignKey = keys[i];
+                spawnedCards.Add(selector); // 🌟 카드를 뽑을 때마다 명부에 등록! (이 부분이 중요합니다)
+            }
+
+            CardDisplay display = newCard.GetComponent<CardDisplay>();
+            if (display != null) display.SetupCard(drawnCardData);
+            
+            newCard.name = "Card_" + drawnCardData.cardName; 
+        }
+    }
+
+    // 🌟 SkillManager가 "지금 선택된 카드 줘!" 할 때 꺼내주는 함수
+    public CardData GetSelectedCardData()
+    {
+        foreach (var card in spawnedCards)
+        {
+            if (card != null && card.isSelected)
+            {
+                return card.GetComponent<CardDisplay>().cardData;
+            }
+        }
+        return null;
+    }
+}
