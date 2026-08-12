@@ -1,0 +1,28 @@
+using UnityEngine;
+
+// 🌟 추가됨: 우리가 게임에 넣을 스탠드 스킬들의 목록입니다!
+public enum SkillType
+{
+    none,                  // 스킬 없음
+    독심술,                 // 허밋 퍼플 (킹/퀸 제외 상대 말 하나 한턴 조종)
+    로드롤러,               // 더 월드 (한턴 뒤 밀어버림)
+    오라오라_러쉬,           // 스타 플래티나 (폰/비숍/나이트가 정면 적 공격)
+    에메랄드_스플래쉬,         // 하이에로팬트 그린 (원거리 저격)
+    크로스파이어_허리케인,          // 매지션즈 레드 (십자 폭발)
+    더_풀,         // 더 풀 (한턴 무적 부여)
+    러쉬          // 실버 채리엇 (3턴 연속 이동, 공격 불가)
+}
+
+[CreateAssetMenu(fileName = "New Card", menuName = "Card Data")]
+public class CardData : ScriptableObject
+{
+    public string cardName;       
+    public Sprite cardImage;      
+    [TextArea(3, 5)] 
+    public string description;    
+    public GameObject customPrefab; 
+
+    // 🌟 추가됨: 이 카드가 어떤 스킬을 가지고 있는지 설정하는 칸
+    [Header("스탠드 능력 설정")]
+    public SkillType skillType; 
+}
