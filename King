@@ -1,0 +1,42 @@
+using UnityEngine;
+
+public class King : ChessPiece
+{
+    public override ChessPieceType PieceType => ChessPieceType.King;
+
+    public override bool IsValidMove(int startX, int startY, int targetX, int targetY, GameObject[,] boardPieces)
+    {
+        int deltaX = Mathf.Abs(targetX - startX);
+        int deltaY = Mathf.Abs(targetY - startY);
+
+        // 1. 기본 이동 (모든 방향으로 1칸)
+        if (deltaX <= 1 && deltaY <= 1) return true;
+
+        // 2. 캐슬링 (Castling) 규칙 검사
+        // 킹이 한 번도 안 움직였고, 수평으로 딱 2칸 움직이려 할 때
+        if (!hasMoved && deltaY == 0 && deltaX == 2)
+        {
+            int direction = (targetX > startX) ? 1 : -1; 
+            int rookX = (direction == 1) ? 7 : 0; 
+            
+            GameObject rookObj = boardPieces[rookX, startY];
+            
+            if (rookObj != null)
+            {
+                ChessPiece rookPiece = rookObj.GetComponent<ChessPiece>();
+                
+                // 해당 자리에 룩이 있고, 그 룩도 한 번도 안 움직였다면
+                if (rookPiece != null && !rookPiece.hasMoved)
+                {
+                    // 킹과 룩 사이에 다른 기물이 가로막고 있는지 검사
+                    for (int x = startX + direction; x != rookX; x += direction)
+                    {
+                        if (boardPieces[x, startY] != null) return false; 
+                    }
+                    return true; 
+                }
+            }
+        }
+        return false;
+    }
+}
