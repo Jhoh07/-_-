@@ -1,0 +1,12 @@
+using UnityEngine;
+public class Knight : ChessPiece
+{
+    public override ChessPieceType PieceType => ChessPieceType.Knight;
+
+    public override bool IsValidMove(int startX, int startY, int targetX, int targetY, GameObject[,] boardPieces)
+    {
+        int deltaX = Mathf.Abs(targetX - startX);
+        int deltaY = Mathf.Abs(targetY - startY);
+        return (deltaX == 2 && deltaY == 1) || (deltaX == 1 && deltaY == 2);
+    }
+}
