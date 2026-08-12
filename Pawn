@@ -1,0 +1,27 @@
+using UnityEngine;
+public class Pawn : ChessPiece
+{
+    public override ChessPieceType PieceType => ChessPieceType.Pawn;
+
+    public override bool IsValidMove(int startX, int startY, int targetX, int targetY, GameObject[,] boardPieces)
+    {
+        int direction = isWhite ? 1 : -1;
+        int startingRow = isWhite ? 1 : 6;
+        GameObject targetPiece = boardPieces[targetX, targetY];
+
+        if (targetPiece != null)
+        {
+            if (Mathf.Abs(targetX - startX) == 1 && targetY == startY + direction) return true;
+        }
+        else
+        {
+            if (targetX == startX && targetY == startY + direction) return true;
+            if (startY == startingRow && targetX == startX && targetY == startY + (direction * 2))
+            {
+                if (boardPieces[startX, startY + direction] == null) return true;
+            }
+        }
+
+        return false;
+    }
+}
