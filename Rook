@@ -1,0 +1,30 @@
+using UnityEngine;
+public class Rook : ChessPiece
+{
+    public override ChessPieceType PieceType => ChessPieceType.Rook;
+
+    public override bool IsValidMove(int startX, int startY, int targetX, int targetY, GameObject[,] boardPieces)
+    {
+        if (startX != targetX && startY != targetY) return false;
+
+        if (startY == targetY)
+        {
+            int minX = Mathf.Min(startX, targetX) + 1;
+            int maxX = Mathf.Max(startX, targetX) - 1;
+            for (int x = minX; x <= maxX; x++)
+                if (boardPieces[x, startY] != null) return false;
+            return true;
+        }
+
+        if (startX == targetX)
+        {
+            int minY = Mathf.Min(startY, targetY) + 1;
+            int maxY = Mathf.Max(startY, targetY) - 1;
+            for (int y = minY; y <= maxY; y++)
+                if (boardPieces[startX, y] != null) return false;
+            return true;
+        }
+
+        return false;
+    }
+}
