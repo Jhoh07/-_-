@@ -1,0 +1,369 @@
+using UnityEngine;
+using System.Collections.Generic;
+
+[RequireComponent(typeof(ChessBoard))]
+public class ChessBoardManager : MonoBehaviour
+{
+    private const int BoardSize = 8;
+
+    private ChessBoard board;
+    private ChessAI aiController;
+    public GameObject[,] boardPieces => board.pieces;
+
+    [Header("시각 효과")]
+    public GameObject HighlightPrefab;
+    private readonly List<GameObject> activeHighlights = new List<GameObject>();
+
+    public bool isWhiteTurn = true;
+    public bool isGameOver = false;
+
+    private GameObject selectedPiece = null;
+    private Vector2Int selectedPiecePos;
+
+    void Start()
+    {
+        board = GetComponent<ChessBoard>();
+        aiController = GetComponent<ChessAI>();
+        board.InitializeBoard();
+        Debug.Log("게임 시작! 백(White)의 턴입니다.");
+    }
+
+    void Update()
+    {
+        if (isGameOver || IsAITurn) return;
+        if (Input.GetMouseButtonDown(0)) HandleMouseClick();
+    }
+
+    private bool IsAITurn =>
+        aiController != null &&
+        aiController.aiEnabled &&
+        aiController.aiPlaysWhite == isWhiteTurn;
+
+    private void HandleMouseClick()
+    {
+        if (Camera.main == null) return;
+
+        Vector3 mouseWorldPos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
+        mouseWorldPos.z = 0f;
+        Vector3Int clickedCellPos = board.GetCellPositionFromWorld(mouseWorldPos);
+
+        int clickX = clickedCellPos.x;
+        int clickY = clickedCellPos.y;
+
+        if (!board.IsPositionOnBoard(clickX, clickY)) return;
+
+        if (selectedPiece == null)
+        {
+            TrySelectPiece(clickX, clickY);
+            return;
+        }
+
+        if (clickX == selectedPiecePos.x && clickY == selectedPiecePos.y)
+        {
+            ClearSelection();
+            return;
+        }
+
+        if (TryMoveSelectedPiece(clickX, clickY))
+            ClearSelection();
+        else
+        {
+            Debug.Log("🚨 [경고] 그곳으로는 이동할 수 없거나, 내 킹이 위험해지는 수입니다!");
+            ClearSelection();
+        }
+    }
+
+    private void TrySelectPiece(int x, int y)
+    {
+        GameObject piece = board.pieces[x, y];
+        if (piece == null) return;
+
+        ChessPiece chessPiece = piece.GetComponent<ChessPiece>();
+        if (chessPiece == null || chessPiece.isWhite != isWhiteTurn) return;
+
+        selectedPiece = piece;
+        selectedPiecePos = new Vector2Int(x, y);
+        ShowHighlights(x, y);
+    }
+
+    private bool TryMoveSelectedPiece(int targetX, int targetY)
+    {
+        if (selectedPiece == null) return false;
+        if (!IsValidMove(selectedPiece, selectedPiecePos.x, selectedPiecePos.y, targetX, targetY)) return false;
+
+        ExecuteMove(selectedPiece, selectedPiecePos.x, selectedPiecePos.y, targetX, targetY);
+        return true;
+    }
+
+    private void ShowHighlights(int startX, int startY)
+    {
+        ClearHighlights();
+        if (HighlightPrefab == null || selectedPiece == null) return;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                if (!IsValidMove(selectedPiece, startX, startY, x, y)) continue;
+                Vector3 worldPos = board.GetWorldPositionFromBoard(x, y);
+                worldPos.z = 1f;
+                GameObject highlight = Instantiate(HighlightPrefab, worldPos, Quaternion.identity);
+                activeHighlights.Add(highlight);
+            }
+        }
+    }
+
+    private void ClearSelection()
+    {
+        selectedPiece = null;
+        ClearHighlights();
+    }
+
+    private void ClearHighlights()
+    {
+        foreach (GameObject highlight in activeHighlights)
+            Destroy(highlight);
+
+        activeHighlights.Clear();
+    }
+
+    public void ExecuteMove(GameObject piece, int startX, int startY, int targetX, int targetY)
+    {
+        string movingPieceName = GetDisplayPieceName(piece);
+        string from = ToBoardNotation(startX, startY);
+        string to = ToBoardNotation(targetX, targetY);
+
+        string capturedPieceName = CaptureTargetPiece(targetX, targetY);
+
+        ChessPiece chessPiece = piece.GetComponent<ChessPiece>();
+        if (chessPiece != null)
+            chessPiece.hasMoved = true;
+
+        ApplyCastlingIfNeeded(piece, startX, startY, targetX, targetY);
+        MovePieceOnBoard(piece, startX, startY, targetX, targetY);
+        TryPromotePawn(chessPiece, targetX, targetY);
+
+        LogMove(movingPieceName, from, to, capturedPieceName);
+
+        if (isGameOver) return;
+
+        isWhiteTurn = !isWhiteTurn;
+        EvaluateGameState();
+    }
+
+    private string CaptureTargetPiece(int targetX, int targetY)
+    {
+        GameObject targetPiece = board.pieces[targetX, targetY];
+        if (targetPiece == null) return null;
+
+        string capturedPieceName = GetDisplayPieceName(targetPiece);
+
+        if (targetPiece.GetComponent<King>() != null)
+        {
+            isGameOver = true;
+            string winner = isWhiteTurn ? "백(White)" : "흑(Black)";
+            Debug.Log($"👑 킹이 포획되었습니다! {winner}의 승리! 게임 종료.");
+        }
+
+        Destroy(targetPiece);
+        return capturedPieceName;
+    }
+
+    private static string GetDisplayPieceName(GameObject piece)
+    {
+        if (piece == null)
+            return "Unknown";
+
+        string name = piece.name.Replace("(Clone)", "").Trim();
+        name = name.Replace("White", "").Replace("Black", "").Trim();
+        return string.IsNullOrEmpty(name) ? "Piece" : name;
+    }
+
+    private static string ToBoardNotation(int x, int y)
+    {
+        char file = (char)('a' + x);
+        int rank = y + 1;
+        return $"{file}{rank}";
+    }
+
+    private void LogMove(string movingPieceName, string from, string to, string capturedPieceName)
+    {
+        string side = isWhiteTurn ? "백" : "흑";
+
+        if (!string.IsNullOrEmpty(capturedPieceName))
+            Debug.Log($"[{side}] {movingPieceName} {from} -> {to} (캡처: {capturedPieceName})");
+        else
+            Debug.Log($"[{side}] {movingPieceName} {from} -> {to}");
+    }
+
+    private void ApplyCastlingIfNeeded(GameObject piece, int startX, int startY, int targetX, int targetY)
+    {
+        if (piece.GetComponent<King>() == null || Mathf.Abs(targetX - startX) != 2) return;
+
+        int direction = targetX > startX ? 1 : -1;
+        int rookStartX = direction == 1 ? 7 : 0;
+        int rookTargetX = targetX - direction;
+
+        GameObject rook = board.pieces[rookStartX, startY];
+        if (rook == null) return;
+
+        board.UpdatePiecePosition(rook, rookTargetX, startY);
+        board.pieces[rookStartX, startY] = null;
+        board.pieces[rookTargetX, startY] = rook;
+
+        ChessPiece rookPiece = rook.GetComponent<ChessPiece>();
+        if (rookPiece != null)
+            rookPiece.hasMoved = true;
+
+        Debug.Log("🏰 캐슬링 발동! 킹과 룩이 자리를 방어합니다.");
+    }
+
+    private void MovePieceOnBoard(GameObject piece, int startX, int startY, int targetX, int targetY)
+    {
+        board.UpdatePiecePosition(piece, targetX, targetY);
+        board.pieces[startX, startY] = null;
+        board.pieces[targetX, targetY] = piece;
+    }
+
+    private void TryPromotePawn(ChessPiece chessPiece, int targetX, int targetY)
+    {
+        if (!(chessPiece is Pawn pawnPiece)) return;
+        if ((pawnPiece.isWhite && targetY != BoardSize - 1) || (!pawnPiece.isWhite && targetY != 0)) return;
+
+        Destroy(pawnPiece.gameObject);
+        GameObject queenPrefab = pawnPiece.isWhite ? board.WhiteQueenPrefab : board.BlackQueenPrefab;
+        Vector3 spawnPos = board.GetWorldPositionFromBoard(targetX, targetY);
+        GameObject newQueen = Instantiate(queenPrefab, spawnPos, Quaternion.identity);
+        newQueen.transform.SetParent(board.transform);
+
+        ChessPiece queenPiece = newQueen.GetComponent<ChessPiece>();
+        if (queenPiece != null)
+            queenPiece.isWhite = pawnPiece.isWhite;
+
+        board.pieces[targetX, targetY] = newQueen;
+        Debug.Log("🌟 프로모션 발동!");
+    }
+
+    private void EvaluateGameState()
+    {
+        bool inCheck = IsKingInCheck(isWhiteTurn);
+        bool hasValidMoves = HasAnyValidMove(isWhiteTurn);
+
+        if (inCheck && !hasValidMoves)
+        {
+            isGameOver = true;
+            Debug.Log($"👑 체크메이트! { (!isWhiteTurn ? "백(White)" : "흑(Black)") }의 승리입니다! 게임 종료.");
+        }
+        else if (!inCheck && !hasValidMoves)
+        {
+            isGameOver = true;
+            Debug.Log("🤝 스탤메이트(무승부)!");
+        }
+        else if (inCheck)
+        {
+            Debug.Log("🚨 체크(Check)!");
+        }
+    }
+
+    public bool IsValidMove(GameObject piece, int startX, int startY, int targetX, int targetY)
+    {
+        if (!IsRuleValidMove(piece, startX, startY, targetX, targetY)) return false;
+
+        ChessPiece cp = piece.GetComponent<ChessPiece>();
+        if (cp == null) return false;
+
+        bool isWhite = cp.isWhite;
+        GameObject targetPiece = board.pieces[targetX, targetY];
+
+        board.pieces[targetX, targetY] = piece;
+        board.pieces[startX, startY] = null;
+
+        bool isCheck = IsKingInCheck(isWhite);
+
+        board.pieces[startX, startY] = piece;
+        board.pieces[targetX, targetY] = targetPiece;
+
+        return !isCheck;
+    }
+
+    public bool IsKingInCheck(bool isWhite)
+    {
+        Vector2Int kingPos = FindKingPosition(isWhite);
+        if (kingPos.x == -1) return false;
+
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject attacker = board.pieces[x, y];
+                ChessPiece cp = attacker?.GetComponent<ChessPiece>();
+                if (cp == null || cp.isWhite == isWhite) continue;
+
+                if (IsRuleValidMove(attacker, x, y, kingPos.x, kingPos.y))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private Vector2Int FindKingPosition(bool isWhite)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = board.pieces[x, y];
+                if (piece == null) continue;
+                ChessPiece cp = piece.GetComponent<ChessPiece>();
+                if (cp == null || cp.isWhite != isWhite) continue;
+                if (piece.GetComponent<King>() != null)
+                    return new Vector2Int(x, y);
+            }
+        }
+
+        return new Vector2Int(-1, -1);
+    }
+
+    public bool HasAnyValidMove(bool forWhite)
+    {
+        for (int x = 0; x < BoardSize; x++)
+        {
+            for (int y = 0; y < BoardSize; y++)
+            {
+                GameObject piece = board.pieces[x, y];
+                ChessPiece cp = piece?.GetComponent<ChessPiece>();
+                if (cp == null || cp.isWhite != forWhite) continue;
+
+                for (int tx = 0; tx < BoardSize; tx++)
+                {
+                    for (int ty = 0; ty < BoardSize; ty++)
+                    {
+                        if (IsValidMove(piece, x, y, tx, ty))
+                            return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public bool IsRuleValidMove(GameObject piece, int startX, int startY, int targetX, int targetY)
+    {
+        if (piece == null) return false;
+
+        ChessPiece pieceScript = piece.GetComponent<ChessPiece>();
+        if (pieceScript == null) return false;
+
+        GameObject targetPiece = board.pieces[targetX, targetY];
+        if (targetPiece != null)
+        {
+            ChessPiece targetScript = targetPiece.GetComponent<ChessPiece>();
+            if (targetScript != null && pieceScript.isWhite == targetScript.isWhite)
+                return false;
+        }
+
+        return pieceScript.IsValidMove(startX, startY, targetX, targetY, board.pieces);
+    }
+}
