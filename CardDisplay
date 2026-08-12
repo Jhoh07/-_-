@@ -1,0 +1,32 @@
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro; // 🌟 핵심: 최신 텍스트(TextMeshPro)를 인식하게 해줍니다!
+
+public class CardDisplay : MonoBehaviour
+{
+    public CardData cardData;
+
+    [Header("UI 연결")]
+    // 🌟 Text 대신 TextMeshProUGUI 로 변경되었습니다!
+    public TextMeshProUGUI nameText;
+    public TextMeshProUGUI descriptionText;
+    public Image artworkImage;
+
+    void Start()
+    {
+        if (cardData != null)
+        {
+            SetupCard(cardData);
+        }
+    }
+
+    public void SetupCard(CardData newData)
+    {
+        cardData = newData;
+
+        // UI에 데이터 덮어씌우기
+        nameText.text = cardData.cardName;
+        descriptionText.text = cardData.description;
+        artworkImage.sprite = cardData.cardImage;
+    }
+}
