@@ -1,0 +1,36 @@
+using UnityEngine;
+
+[ExecuteInEditMode]
+public class CardFanLayout : MonoBehaviour
+{
+    [Header("부채꼴 세팅")]
+    public float spacing = 10f;       // 카드 사이의 가로 간격
+    public float curveHeight = 30f;    // 부채꼴의 둥근 정도 (높이)
+    public float maxAngle = 15f;       // 양 끝 카드가 기울어지는 최대 각도
+
+    void Update()
+    {
+        int cardCount = transform.childCount;
+        if (cardCount == 0) return;
+
+        for (int i = 0; i < cardCount; i++)
+        {
+            RectTransform card = transform.GetChild(i).GetComponent<RectTransform>();
+            if (card == null) continue;
+
+            // 카드가 1장일 때는 중앙(0), 여러 장일 때는 -1 ~ 1 사이의 비율(t)로 변환합니다.
+            float t = 0;
+            if (cardCount > 1) t = ((float)i / (cardCount - 1)) * 2f - 1f;
+
+            // 1. 회전: 중앙은 0도, 양 끝은 maxAngle만큼 기울어짐
+            float angle = t * -maxAngle;
+            card.localRotation = Quaternion.Euler(0, 0, angle);
+
+            // 2. 위치: X는 간격만큼 벌어지고, Y는 포물선(t * t)을 그려서 둥글게 깎아내림
+            float xPos = t * (spacing * (cardCount - 1) / 2f);
+            float yPos = -(t * t) * curveHeight;
+            
+            card.anchoredPosition = new Vector2(xPos, yPos);
+        }
+    }
+}
